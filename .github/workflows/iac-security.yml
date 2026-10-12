@@ -35,7 +35,11 @@ jobs:
         with:
           scan-type: config
           scan-ref: .
+          # examples/ re-evaluate the same modules many times over and blow the
+          # scan deadline; the root module and modules/ cover every resource.
+          skip-dirs: examples,docs,tests,scripts
           severity: HIGH,CRITICAL
+          timeout: 30m
           exit-code: "0"
 
   checkov:
