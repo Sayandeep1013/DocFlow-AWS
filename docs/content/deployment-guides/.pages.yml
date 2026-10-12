@@ -1,0 +1,6 @@
+nav:
+  - index.md
+  - monitoring.md
+  - local-lambda-build.md
+  - local-web-ui-build.md
+  - troubleshooting.md

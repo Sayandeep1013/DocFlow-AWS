@@ -1,0 +1,102 @@
+# Pre-commit configuration for Terraform best practices
+# Install with: pip install pre-commit && pre-commit install
+#
+# Hook policy:
+#   - Formatters and basic file hygiene checks BLOCK commits.
+#   - terraform_validate / tflint / tfsec only WARN. Their output is shown
+#     but they always exit 0 so they cannot block a commit. CI / `make all`
+#     remain the authoritative gate for those.
+
+repos:
+  # Terraform formatting + docs (still blocking; they auto-fix or are cheap)
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.86.0
+    hooks:
+      - id: terraform_fmt
+        name: Terraform format
+        description: Rewrites all Terraform configuration files to a canonical format
+        files: (\.tf|\.tfvars)$
+        exclude: \.terraform/.*$
+
+      - id: terraform_docs
+        name: Terraform docs
+        description: Inserts input and output documentation into README.md
+        files: (\.tf)$
+        exclude: \.terraform/.*$
+        args:
+          - --hook-config=--path-to-file=README.md
+          - --hook-config=--add-to-existing-file=true
+          - --hook-config=--create-file-if-not-exist=true
+
+  # Warning-only Terraform checks. These run the same tools as `make validate`,
+  # `make lint`, and `make security`, but never fail the commit. Use
+  # `make all` (or CI) for the authoritative gate.
+  - repo: local
+    hooks:
+      - id: terraform_validate_warn
+        name: Terraform validate (warn-only)
+        description: Runs make validate. Output is informational; exit code is ignored.
+        entry: scripts/precommit-warn.sh validate
+        language: system
+        pass_filenames: false
+        files: (\.tf|\.tfvars)$
+        exclude: \.terraform/.*$
+        verbose: true
+
+      - id: terraform_tflint_warn
+        name: Terraform lint (warn-only)
+        description: Runs make lint. Output is informational; exit code is ignored.
+        entry: scripts/precommit-warn.sh lint
+        language: system
+        pass_filenames: false
+        files: (\.tf)$
+        exclude: \.terraform/.*$
+        verbose: true
+
+      - id: terraform_tfsec_warn
+        name: Terraform security scan (warn-only)
+        description: Runs make security. Output is informational; exit code is ignored.
+        entry: scripts/precommit-warn.sh security
+        language: system
+        pass_filenames: false
+        files: (\.tf)$
+        exclude: \.terraform/.*$
+        verbose: true
+
+  # General hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        name: Trim trailing whitespace
+        types: [text]
+
+      - id: end-of-file-fixer
+        name: Fix end of files
+        types: [text]
+
+      - id: check-merge-conflict
+        name: Check for merge conflicts
+        types: [text]
+
+      - id: check-yaml
+        name: Check YAML
+        files: \.ya?ml$
+        args: ['--unsafe']
+
+      - id: check-json
+        name: Check JSON
+        files: \.json$
+
+      - id: check-added-large-files
+        name: Check for added large files
+        args: ['--maxkb=1000']
+
+  # Markdown hooks
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.38.0
+    hooks:
+      - id: markdownlint
+        name: Markdown lint
+        files: \.md$
+        args: ['--fix']

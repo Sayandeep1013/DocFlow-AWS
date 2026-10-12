@@ -1,0 +1,370 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+variable "region" {
+  description = "AWS region to deploy resources"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "prefix" {
+  description = "Prefix to add to resource names"
+  type        = string
+  default     = "idp"
+}
+
+# User Identity Configuration
+variable "admin_email" {
+  description = "Optional email address for the admin user. If provided, an admin user will be created in the Cognito User Pool."
+  type        = string
+  default     = null
+}
+
+variable "log_level" {
+  description = "The log level for the document processing components"
+  type        = string
+  default     = "INFO"
+  validation {
+    condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], var.log_level)
+    error_message = "Allowed values for log_level are \"DEBUG\", \"INFO\", \"WARNING\", \"ERROR\", or \"CRITICAL\"."
+  }
+}
+
+variable "log_retention_days" {
+  description = "Retention period in days for CloudWatch logs from the document-processing components. Null (default) uses the deployment default."
+  type        = number
+  default     = null
+  validation {
+    condition     = var.log_retention_days == null ? true : contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653], var.log_retention_days)
+    error_message = "Log retention days must be one of the allowed values."
+  }
+}
+
+variable "data_tracking_retention_days" {
+  description = "The retention period for document tracking data in days"
+  type        = number
+  default     = 365
+}
+
+# API Configuration (Consolidated)
+variable "api" {
+  description = "Configuration for the REST API and all API-related features"
+  type = object({
+    # Core API configuration
+    enabled = optional(bool, true)
+
+    # Agent Analytics (GraphQL resolvers for agent functionality)
+    agent_analytics = optional(object({
+      enabled  = optional(bool, false)
+      model_id = optional(string, "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    }), { enabled = false })
+
+    # Discovery (Document discovery and classification workflow)
+    discovery = optional(object({
+      enabled = optional(bool, false)
+    }), { enabled = false })
+
+    # Chat with Document (Document Q&A using Bedrock and Knowledge Base)
+    chat_with_document = optional(object({
+      enabled                  = optional(bool, true)
+      guardrail_id_and_version = optional(string, null)
+    }), { enabled = true })
+
+    # Process Changes (Document editing and reprocessing)
+    process_changes = optional(object({
+      enabled = optional(bool, false)
+    }), { enabled = false })
+
+    # Knowledge Base (external dependency for chat feature)
+    knowledge_base = optional(object({
+      enabled            = optional(bool, true)
+      knowledge_base_arn = optional(string)
+      model_id           = optional(string, "us.amazon.nova-pro-v1:0")
+      embedding_model_id = optional(string, "amazon.titan-embed-text-v2:0")
+    }), { enabled = true })
+
+    # v0.4.8 feature flags
+    enable_agent_companion_chat = optional(bool, false)
+    enable_test_studio          = optional(bool, false)
+    enable_fcc_dataset          = optional(bool, false)
+    enable_w2_dataset           = optional(bool, false)
+    enable_error_analyzer       = optional(bool, false)
+    enable_mcp                  = optional(bool, false)
+
+    # v0.5.11 — version-check resolver. When public_artifacts_bucket is
+    # empty (default), the getLatestPublishedVersion resolver is not created.
+    public_artifacts_bucket = optional(string, "")
+    public_artifacts_prefix = optional(string, "artifacts/genai-idp")
+    public_artifacts_region = optional(string, "")
+
+    # v0.4.16 feature flags
+    enable_hitl                     = optional(bool, true)
+    enable_capacity_planning        = optional(bool, false)
+    enable_omni_ai_dataset          = optional(bool, false)
+    enable_docplit_poly_seq_dataset = optional(bool, false)
+  })
+
+  default = {
+    enabled            = true
+    agent_analytics    = { enabled = false }
+    discovery          = { enabled = false }
+    chat_with_document = { enabled = true }
+    process_changes    = { enabled = false }
+    knowledge_base     = { enabled = true }
+  }
+
+  # Note: We intentionally do not validate that knowledge_base_arn is non-null
+  # when knowledge_base.enabled is true. This example creates the OpenSearch
+  # Serverless collection + Bedrock Knowledge Base itself in `knowledge-base.tf`
+  # and wires the resulting ARN through `main.tf` at apply time. Validation
+  # rules run before resource creation, so requiring the ARN up-front would
+  # block the self-managed KB workflow that the example is designed for.
+
+  validation {
+    condition     = !var.api.agent_analytics.enabled || var.api.agent_analytics.model_id != null
+    error_message = "When api.agent_analytics.enabled is true, model_id must be provided."
+  }
+}
+
+# RBAC feature plugin (v0.5.12) — forwarded to module.rbac at the root.
+# Default-off. When enabled, provisions the four Cognito groups (Admin/Author/
+# Reviewer/Viewer), the Users table, and the user-management Lambda. Requires a
+# Cognito user pool (this example always provisions one), enforced at plan time.
+variable "rbac" {
+  description = "Configuration for the RBAC feature plugin. Default-off. When enabled, wires module.rbac through the feature-plugin path."
+  type = object({
+    enabled = optional(bool, false)
+    group_names = optional(object({
+      admin    = optional(string, "Admin")
+      author   = optional(string, "Author")
+      reviewer = optional(string, "Reviewer")
+      viewer   = optional(string, "Viewer")
+    }), {})
+    allowed_signup_email_domains = optional(string, "")
+  })
+  default = {
+    enabled = false
+  }
+}
+
+# External SAML/OIDC IdP federation feature plugin (v0.5.12) — forwarded to
+# module.idp_federation at the root. Default-off. The OIDC client secret is
+# supplied by REFERENCE (oidc_client_secret_ref — a Secrets Manager ARN / SSM
+# parameter name), never as a raw value. When both rbac and idp_federation are
+# enabled, the federation group-mapping targets the four RBAC group names.
+variable "idp_federation" {
+  description = "Configuration for the external SAML/OIDC IdP federation feature plugin. Default-off. The OIDC client secret is supplied by reference, never in plaintext."
+  type = object({
+    enabled                = optional(bool, false)
+    provider_type          = optional(string, "SAML")
+    provider_name          = optional(string, "ExternalIdP")
+    saml_metadata_url      = optional(string, "")
+    saml_metadata_file     = optional(string, "")
+    oidc_issuer            = optional(string, "")
+    oidc_client_id         = optional(string, "")
+    oidc_client_secret_ref = optional(string, "")
+    oidc_authorize_scopes  = optional(string, "openid email profile")
+    attribute_mapping      = optional(map(string), {})
+    group_attribute_name   = optional(string, "")
+    group_mapping          = optional(map(string), {})
+  })
+  default = {
+    enabled = false
+  }
+}
+
+# DEPRECATED: Individual API feature variables (use 'api' variable instead)
+# These are kept for backward compatibility and will be removed in a future version
+variable "enable_api" {
+  description = "DEPRECATED: Use api.enabled instead. Enable the REST API for programmatic access and notifications"
+  type        = bool
+  default     = null
+}
+
+variable "agent_analytics" {
+  description = "DEPRECATED: Use api.agent_analytics instead. Configuration for agent analytics functionality"
+  type = object({
+    enabled  = optional(bool, false)
+    model_id = optional(string, "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+  })
+  default = null
+}
+
+variable "discovery" {
+  description = "DEPRECATED: Use api.discovery instead. Configuration for document discovery functionality"
+  type = object({
+    enabled = optional(bool, false)
+  })
+  default = null
+}
+
+variable "chat_with_document" {
+  description = "DEPRECATED: Use api.chat_with_document instead. Configuration for chat with document functionality"
+  type = object({
+    enabled                  = optional(bool, false)
+    guardrail_id_and_version = optional(string, null)
+  })
+  default = null
+}
+
+variable "process_changes" {
+  description = "DEPRECATED: Use api.process_changes instead. Configuration for document editing and reprocessing functionality"
+  type = object({
+    enabled = optional(bool, false)
+  })
+  default = null
+}
+
+variable "web_ui" {
+  description = "Web UI configuration object"
+  type = object({
+    enabled                      = optional(bool, true)
+    create_infrastructure        = optional(bool, true)
+    bucket_name                  = optional(string, null)
+    cloudfront_distribution_id   = optional(string, null)
+    logging_enabled              = optional(bool, true)
+    logging_bucket_arn           = optional(string, null)
+    logging_bucket_force_destroy = optional(bool, false)
+    enable_signup                = optional(string, "")
+  })
+  default = {
+    enabled                    = true
+    create_infrastructure      = true
+    bucket_name                = null
+    cloudfront_distribution_id = null
+    logging_enabled            = true
+    logging_bucket_arn         = null
+    enable_signup              = ""
+  }
+}
+
+variable "enable_evaluation" {
+  description = "Enable evaluation functionality (simplified flag)"
+  type        = bool
+  default     = false
+}
+
+# Reporting Configuration
+variable "enable_reporting" {
+  description = "Enable reporting functionality (simplified flag)"
+  type        = bool
+  default     = false
+}
+
+# Model Configuration
+#
+# Per-stage model IDs are set in the config YAML, not here.
+# Summarization enablement comes from the config YAML (summarization.enabled).
+
+# Processor-pipeline HITL enablement comes from the config YAML (hitl.enabled).
+# The API-side HITL review feature is controlled by api.enable_hitl.
+
+# v0.4.16: Rule Validation
+# Rule-validation enablement comes from the config YAML (rule_validation.enabled).
+
+# v0.4.16: Lambda Hook Inference — custom Lambda ARNs injected into the Step Functions workflow.
+# Each ARN must start with the 'GENAIIDP-' prefix (enforced by the bedrock-llm-processor module).
+variable "lambda_hook_ocr" {
+  description = "ARN of custom Lambda hook for OCR stage (must start with 'GENAIIDP-')"
+  type        = string
+  default     = ""
+}
+
+variable "lambda_hook_classification" {
+  description = "ARN of custom Lambda hook for classification stage (must start with 'GENAIIDP-')"
+  type        = string
+  default     = ""
+}
+
+variable "lambda_hook_extraction" {
+  description = "ARN of custom Lambda hook for extraction stage (must start with 'GENAIIDP-')"
+  type        = string
+  default     = ""
+}
+
+variable "lambda_hook_assessment" {
+  description = "ARN of custom Lambda hook for assessment stage (must start with 'GENAIIDP-')"
+  type        = string
+  default     = ""
+}
+
+variable "lambda_hook_summarization" {
+  description = "ARN of custom Lambda hook for summarization stage (must start with 'GENAIIDP-')"
+  type        = string
+  default     = ""
+}
+
+# Configuration File Path
+variable "config_file_path" {
+  description = "Path to the configuration YAML file for document processing"
+  type        = string
+  default     = "../../sources/config_library/unified/lending-package-sample/config.yaml"
+}
+
+variable "additional_config_files" {
+  description = "Extra config versions to seed alongside the default, as version_name => path to a YAML file (relative to this example dir or absolute). Each shows in the UI version dropdown as an editable, non-active version. Manage this list from terraform.tfvars."
+  type        = map(string)
+  default     = {}
+}
+
+# When true, append the demonstration classes in
+# config-overlays/round3-x-aws-idp-flags.yaml (the config-shape `x-aws-idp-*`
+# flags) onto the seeded config's classes list so the flags travel through the
+# configuration seeder unchanged. The flags are runtime-enforced upstream and
+# add no AWS resources. Set false to seed the base config verbatim.
+variable "demo_x_aws_idp_flags" {
+  description = "Demonstrate the config-shape x-aws-idp-* schema flags by appending overlay classes to the seeded config; the flags pass through the seeder unchanged."
+  type        = bool
+  default     = true
+}
+
+variable "tags" {
+  description = "Tags to apply to all resources"
+  type        = map(string)
+  default     = {}
+}
+
+#
+# Build strategy. Forwarded verbatim to the wrapper's var.build. Defaults
+# preserve the historical CodeBuild path; set lambda_local = true to opt
+# into the local-build path (requires Docker/Podman/Finch on the deploy
+# host). See docs/content/deployment-guides/local-lambda-build.md.
+#
+variable "build" {
+  description = "Build strategy for Lambda layers and processor container images."
+  type = object({
+    lambda_local        = optional(bool, false)
+    lambda_architecture = optional(string, "arm64")
+    container_runtime   = optional(string, "auto")
+    ui_local            = optional(bool, false)
+  })
+  default = {
+    lambda_local        = false
+    lambda_architecture = "arm64"
+    container_runtime   = "auto"
+    ui_local            = false
+  }
+}
+
+variable "seed_managed_configs" {
+  description = "Seed the managed baseline configuration versions (RVL-CDIP docsplit, fake-w2, ocr-benchmark, realkie-fcc) as non-active reference rows. Set true to include them."
+  type        = bool
+  default     = false
+}
+
+variable "deployer_role_arn" {
+  description = "IAM role ARN granted data access on the OpenSearch Serverless collection. Must be a role ARN, not a session ARN: AOSS matches any session of a role, so a session ARN pins the policy to one operator. Defaults to deriving the role from the caller, which drops any path on the role."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.deployer_role_arn == "" || !can(regex(":assumed-role/", var.deployer_role_arn))
+    error_message = "deployer_role_arn must be an IAM role ARN (arn:<partition>:iam::<account>:role/<name>), not an STS assumed-role session ARN."
+  }
+}
+
+variable "bedrock_guardrail_id_and_version" {
+  description = "Bedrock Guardrail applied to every model interaction, as `id:version`. Null applies no guardrail."
+  type        = string
+  default     = null
+}

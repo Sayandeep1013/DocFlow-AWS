@@ -1,0 +1,222 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+variable "region" {
+  description = "AWS region to deploy resources"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "prefix" {
+  description = "Prefix to add to resource names"
+  type        = string
+  default     = "idp"
+}
+
+# VPC Configuration
+variable "vpc_cidr" {
+  description = "CIDR block for the VPC (only used when creating new VPC)"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "vpc" {
+  description = "Existing VPC configuration. If provided, will use existing VPC instead of creating new one. All properties must be provided together."
+  type = object({
+    vpc_id                 = string
+    vpc_subnet_ids         = list(string)
+    vpc_security_group_ids = list(string)
+  })
+  default = null
+
+  validation {
+    condition = var.vpc == null || (
+      try(var.vpc.vpc_id, null) != null &&
+      try(length(var.vpc.vpc_subnet_ids), 0) > 0 &&
+      try(length(var.vpc.vpc_security_group_ids), 0) > 0
+    )
+    error_message = "When vpc is provided, all properties (vpc_id, vpc_subnet_ids, vpc_security_group_ids) must be specified with valid values."
+  }
+}
+
+variable "log_level" {
+  description = "The log level for the document processing components"
+  type        = string
+  default     = "INFO"
+  validation {
+    condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], var.log_level)
+    error_message = "Allowed values for log_level are \"DEBUG\", \"INFO\", \"WARNING\", \"ERROR\", or \"CRITICAL\"."
+  }
+}
+
+variable "log_retention_days" {
+  description = "Retention period in days for CloudWatch logs from the document-processing components. Null (default) uses the deployment default."
+  type        = number
+  default     = null
+  validation {
+    condition     = var.log_retention_days == null ? true : contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653], var.log_retention_days)
+    error_message = "Log retention days must be one of the allowed values."
+  }
+}
+
+variable "data_tracking_retention_days" {
+  description = "The retention period for document tracking data in days"
+  type        = number
+  default     = 365
+}
+
+# Evaluation Configuration
+variable "enable_evaluation" {
+  description = "Enable evaluation functionality (simplified flag)"
+  type        = bool
+  default     = false
+}
+
+# Reporting Configuration
+variable "enable_reporting" {
+  description = "Enable reporting functionality (simplified flag)"
+  type        = bool
+  default     = false
+}
+
+# Model Configuration
+#
+# Per-stage model IDs are set in the config YAML (config_file_path), not here.
+# Summarization enablement comes from the config YAML (summarization.enabled).
+
+# Rule-validation enablement comes from the config YAML (rule_validation.enabled).
+
+
+
+# Configuration File Path
+variable "config_file_path" {
+  description = "Path to the configuration YAML file for document processing"
+  type        = string
+  default     = "../../sources/config_library/unified/lending-package-sample/config.yaml"
+}
+
+variable "additional_config_files" {
+  description = "Extra config versions to seed alongside the default, as version_name => path to a YAML file (relative to this example dir or absolute). Each shows in the UI version dropdown as an editable, non-active version. Manage this list from terraform.tfvars."
+  type        = map(string)
+  default     = {}
+}
+
+variable "tags" {
+  description = "Tags to apply to all resources"
+  type        = map(string)
+  default     = {}
+}
+
+# API Configuration (New Consolidated Structure)
+variable "api" {
+  description = "API configuration for processing environment features"
+  type = object({
+    enabled = optional(bool, false)
+
+    agent_analytics = optional(object({
+      enabled  = optional(bool, false)
+      model_id = optional(string, "us.anthropic.claude-3-haiku-20240307-v1:0")
+    }), { enabled = false })
+
+    discovery = optional(object({
+      enabled = optional(bool, false)
+    }), { enabled = false })
+
+    chat_with_document = optional(object({
+      enabled                  = optional(bool, false)
+      guardrail_id_and_version = optional(string, null)
+    }), { enabled = false })
+
+    process_changes = optional(object({
+      enabled = optional(bool, false)
+    }), { enabled = false })
+
+    knowledge_base = optional(object({
+      enabled            = optional(bool, false)
+      knowledge_base_arn = optional(string, null)
+      model_id           = optional(string, "us.amazon.nova-pro-v1:0")
+      embedding_model_id = optional(string, "amazon.titan-embed-text-v2:0")
+    }), { enabled = false })
+
+    # v0.4.8 feature flags
+    enable_agent_companion_chat = optional(bool, false)
+    enable_test_studio          = optional(bool, false)
+    enable_fcc_dataset          = optional(bool, false)
+    enable_error_analyzer       = optional(bool, false)
+    enable_mcp                  = optional(bool, false)
+
+    # v0.4.16 feature flags
+    enable_hitl                     = optional(bool, true)
+    enable_capacity_planning        = optional(bool, false)
+    enable_omni_ai_dataset          = optional(bool, false)
+    enable_docplit_poly_seq_dataset = optional(bool, false)
+
+    # REST API visibility (v0.6.4). Set to "PRIVATE" to require all callers to
+    # reach the API Gateway REST endpoint via the `execute-api` interface VPC
+    # endpoint this example provisions.
+    api_gateway_visibility = optional(string, "GLOBAL")
+  })
+  default = { enabled = false }
+}
+
+# DEPRECATED: Individual API feature variables (for backward compatibility)
+# These will be removed in a future version. Use the consolidated 'api' variable instead.
+
+variable "discovery" {
+  description = "DEPRECATED: Use api.discovery instead. Configuration for document discovery functionality"
+  type = object({
+    enabled = optional(bool, false)
+  })
+  default = null
+}
+
+variable "chat_with_document" {
+  description = "DEPRECATED: Use api.chat_with_document instead. Configuration for chat with document functionality"
+  type = object({
+    enabled                  = optional(bool, false)
+    guardrail_id_and_version = optional(string, null)
+  })
+  default = null
+}
+
+variable "process_changes" {
+  description = "DEPRECATED: Use api.process_changes instead. Configuration for document editing and reprocessing functionality"
+  type = object({
+    enabled = optional(bool, false)
+  })
+  default = null
+}
+
+variable "admin_email" {
+  description = "Administrator email address for notifications and access"
+  type        = string
+  default     = null
+}
+
+variable "build" {
+  description = "Build strategy for Lambda layers and the web UI (CodeBuild by default; local Docker/npm when the *_local flags are true)."
+  type = object({
+    lambda_local        = optional(bool, false)
+    lambda_architecture = optional(string, "arm64")
+    container_runtime   = optional(string, "auto")
+    ui_local            = optional(bool, false)
+  })
+  default = {
+    lambda_local        = false
+    lambda_architecture = "arm64"
+    container_runtime   = "auto"
+    ui_local            = false
+  }
+}
+
+variable "enable_web_ui" {
+  description = "Whether to deploy the Web UI. Defaults to false because this example provisions a fully-isolated VPC and the default CloudFront hosting is public-internet facing. ALB hosting was removed in v0.6.4; a VPC-capable private hosting mode arrives with APIGateway hosting."
+  type        = bool
+  default     = false
+}
+
+variable "bedrock_guardrail_id_and_version" {
+  description = "Bedrock Guardrail applied to every model interaction, as `id:version`. Null applies no guardrail."
+  type        = string
+  default     = null
+}

@@ -1,0 +1,138 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+variable "name_prefix" {
+  description = "Prefix for resource names"
+  type        = string
+}
+
+variable "input_bucket_arn" {
+  description = "ARN of the S3 bucket for discovery document uploads"
+  type        = string
+}
+
+variable "discovery_bucket_arn" {
+  description = "ARN of the dedicated discovery S3 bucket"
+  type        = string
+  default     = null
+}
+
+variable "data_retention_days" {
+  description = "Number of days to retain discovery documents"
+  type        = number
+  default     = 365
+}
+
+variable "configuration_table_arn" {
+  description = "ARN of the DynamoDB configuration table"
+  type        = string
+}
+
+variable "configuration_table_name" {
+  description = "Name of the DynamoDB configuration table (read by the discovery processor)"
+  type        = string
+  default     = null
+}
+
+variable "allowed_cors_origins" {
+  description = "Allowed CORS origins for the discovery bucket (the web-UI / CloudFront app origin). Empty list falls back to [\"*\"] for backward compatibility (Wiz S3-036)."
+  type        = list(string)
+  default     = []
+}
+
+variable "appsync_api_url" {
+  description = "Legacy APPSYNC_API_URL value, empty since v0.6.4. The processor writes the DiscoveryTable directly"
+  type        = string
+  default     = null
+}
+
+variable "idp_common_layer_arn" {
+  description = "ARN of the IDP common Lambda layer"
+  type        = string
+}
+
+variable "log_level" {
+  description = "Log level for Lambda functions"
+  type        = string
+  default     = "INFO"
+
+  validation {
+    condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], var.log_level)
+    error_message = "log_level must be one of: DEBUG, INFO, WARNING, ERROR, CRITICAL."
+  }
+}
+
+variable "log_retention_days" {
+  description = "CloudWatch log retention period in days"
+  type        = number
+  default     = 30
+  nullable    = false
+
+  validation {
+    condition     = contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653], var.log_retention_days)
+    error_message = "log_retention_days must be a valid CloudWatch Logs retention period."
+  }
+}
+
+variable "encryption_key_arn" {
+  description = "ARN of the KMS key for encryption"
+  type        = string
+  default     = null
+}
+
+variable "vpc_subnet_ids" {
+  description = "List of subnet IDs for Lambda functions"
+  type        = list(string)
+  default     = []
+}
+
+variable "vpc_security_group_ids" {
+  description = "List of security group IDs for Lambda functions"
+  type        = list(string)
+  default     = []
+}
+
+variable "lambda_tracing_mode" {
+  description = "X-Ray tracing mode for Lambda functions. Valid values: Active, PassThrough"
+  type        = string
+  default     = "Active"
+
+  validation {
+    condition     = contains(["Active", "PassThrough"], var.lambda_tracing_mode)
+    error_message = "lambda_tracing_mode must be either 'Active' or 'PassThrough'."
+  }
+}
+
+variable "point_in_time_recovery_enabled" {
+  description = "Enable point-in-time recovery for DynamoDB tables"
+  type        = bool
+  default     = true
+}
+
+variable "tags" {
+  description = "Tags to apply to resources"
+  type        = map(string)
+  default     = {}
+}
+
+variable "s3_endpoint_url" {
+  description = "Optional S3 endpoint URL (VPC interface endpoint) for the discovery upload presigner. When set, presigned URLs target the VPCE via virtual-host addressing. Null (default) uses the global regional S3 endpoint."
+  type        = string
+  default     = null
+}
+
+variable "lambda_architecture" {
+  description = "Target Lambda architecture (x86_64 | arm64). Must match the architecture the idp_common layers were built for; mismatches break native deps (e.g. pydantic_core)."
+  type        = string
+  default     = "arm64"
+  validation {
+    condition     = contains(["x86_64", "arm64"], var.lambda_architecture)
+    error_message = "lambda_architecture must be one of: x86_64, arm64."
+  }
+}
+
+variable "metric_namespace" {
+  description = "CloudWatch metric namespace for the discovery processor. When null, the metric-publish grant is omitted."
+  type        = string
+  default     = null
+}

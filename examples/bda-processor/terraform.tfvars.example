@@ -1,0 +1,46 @@
+# BDA Processor — copy to terraform.tfvars and set the values below.
+# Everything else uses the defaults in variables.tf.
+
+region      = "us-east-1"
+prefix      = "my-idp"
+admin_email = "admin@example.com" # creates the initial Web UI admin user
+
+# ── Optional overrides (defaults shown; uncomment to change) ────────────────
+# Per-stage model IDs are set in the config YAML (config_file_path), not here.
+# enable_evaluation      = false
+# enable_reporting       = false
+# config_file_path       = "../../sources/config_library/unified/rule-validation/config.yaml"
+# web_ui  = { enabled = true }     # set enabled = false to skip CloudFront/UI
+# additional_config_files = { invoices = "../config-catalog/invoices.yaml" }
+# tags = { Environment = "dev" }
+
+# ── Knowledge Base (Document KB + chat) ─────────────────────────────────────
+# create_knowledge_base provisions the OpenSearch + Bedrock KB backend and
+# auto-wires it into the API. Default on.
+# create_knowledge_base = true
+#
+# The KB generation model MUST be a cross-region inference-profile id
+# (us./eu./apac. prefix) — RetrieveAndGenerate is invoked via the profile.
+# The embedding model is a plain foundation-model id.
+# api = {
+#   knowledge_base = {
+#     model_id           = "us.amazon.nova-pro-v1:0"      # generation (inference profile)
+#     embedding_model_id = "amazon.titan-embed-text-v2:0" # embeddings (foundation model)
+#   }
+# }
+#
+# Advanced API/feature toggles (agent analytics, discovery, MCP, HITL,
+# guardrails) also live under the `api` object — see variables.tf.
+
+# ── Build strategy (optional) ────────────────────────────────────────────────
+# Defaults use AWS CodeBuild (in-cloud). Set lambda_local = true to build the
+# Lambda layer zips locally with Docker/Podman/Finch. No processor container
+# images are built — the engine uses zip Lambdas + shared layers. On Apple
+# Silicon, x86_64 layer builds need amd64 emulation (Rosetta).
+# See docs/content/deployment-guides/local-lambda-build.md.
+# build = {
+#   lambda_local        = false
+#   lambda_architecture = "x86_64"
+#   container_runtime   = "auto"
+#   ui_local            = false
+# }

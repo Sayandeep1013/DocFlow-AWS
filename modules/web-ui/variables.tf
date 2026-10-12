@@ -1,0 +1,348 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Core module inputs
+variable "name_prefix" {
+  description = "Prefix for resource naming"
+  type        = string
+}
+
+variable "prefix" {
+  description = "Prefix for resource names"
+  type        = string
+}
+
+variable "display_name" {
+  description = "Display name for the stack (passed from top-level web_ui.display_name configuration)"
+  type        = string
+  default     = null
+}
+
+variable "reporting_bucket_name" {
+  description = "Name of the reporting S3 bucket (extracted from reporting bucket ARN)"
+  type        = string
+  default     = ""
+}
+
+variable "evaluation_baseline_bucket_name" {
+  description = "Name of the evaluation baseline S3 bucket (extracted from evaluation baseline bucket ARN)"
+  type        = string
+  default     = ""
+}
+
+variable "discovery_bucket_name" {
+  description = "Name of the discovery S3 bucket (if discovery is enabled)"
+  type        = string
+  default     = null
+}
+
+variable "knowledge_base_enabled" {
+  description = "Whether Knowledge Base functionality is enabled"
+  type        = bool
+  default     = false
+}
+
+variable "idp_pattern" {
+  description = "IDP processing pattern name (mapped from processor type)"
+  type        = string
+  default     = ""
+}
+
+variable "console_title" {
+  description = "Title shown in the Web UI top-navigation banner. Mirrors upstream ConsoleTitle."
+  type        = string
+  default     = "IDP Accelerator Console"
+}
+
+variable "idp_version" {
+  description = "Upstream IDP version string surfaced in the Web UI Deployment Info panel. Should track the IDP_VERSION file at the repo root."
+  type        = string
+}
+
+#
+# Infrastructure Configuration
+#
+variable "create_infrastructure" {
+  description = "Whether to create CloudFront distribution and web app bucket with default settings"
+  type        = bool
+  default     = true
+}
+
+variable "web_app_bucket_name" {
+  description = "Name of S3 bucket for hosting the web application (required when create_infrastructure is false)"
+  type        = string
+  default     = null
+}
+
+variable "bucket_name_override" {
+  description = <<-EOT
+    Explicit name for the web app bucket, overriding the module-internal
+    "<prefix>-webapp-<random suffix>" naming. Used by APIGateway
+    hosting, where the API Gateway S3-proxy integration must know the bucket
+    name without depending on this module (which would create a module cycle),
+    so the caller derives the name and passes it here. Null (default) keeps the
+    historical internal naming — CloudFront deployments must leave this null so
+    the existing bucket is not replaced.
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "apigw_proxy_role_arn" {
+  description = <<-EOT
+    ARN of the IAM role API Gateway assumes to read the web app bucket when the
+    REST API serves the SPA (hosting = "APIGateway"). Granted s3:GetObject on the
+    bucket objects via a bucket policy. Null (default) creates no policy.
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "hosting" {
+  description = <<-EOT
+    Web UI hosting mode. "CloudFront" (default) creates a CloudFront
+    distribution in front of the web app bucket. "APIGateway" skips CloudFront
+    and serves the bucket through the REST API as an S3 proxy (VPC-capable
+    private posture): the SPA is built with Vite base "/api/" and the bucket is
+    read by the API Gateway proxy role (apigw_proxy_role_arn). Mirrors upstream
+    WebUIHosting. "ALB" was removed in v0.6.4 (upstream deleted ALB hosting).
+  EOT
+  type        = string
+  default     = "CloudFront"
+  validation {
+    condition     = contains(["CloudFront", "APIGateway"], var.hosting)
+    error_message = "hosting must be CloudFront or APIGateway. \"ALB\" was removed in v0.6.4; see docs/migration-v0.5.16-to-v0.6.4.md."
+  }
+}
+
+variable "web_ui_url" {
+  description = <<-EOT
+    Public URL the browser uses to reach the Web UI. Used for input/output
+    bucket CORS allowed-origins and the UI build environment. In CloudFront
+    mode this is derived from the distribution; for non-CloudFront hosting
+    supply the custom domain URL fronting the UI (mirrors upstream
+    CustomDomainUrl). When null and CloudFront is not created, CORS falls back
+    to "*".
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "cloudfront_distribution_id" {
+  description = "CloudFront distribution ID for cache invalidation (optional - skip invalidation if not provided)"
+  type        = string
+  default     = null
+}
+
+#
+# Processing Environment Integration
+#
+variable "input_bucket_arn" {
+  description = "ARN of the S3 bucket for input files"
+  type        = string
+}
+
+variable "output_bucket_arn" {
+  description = "ARN of the S3 bucket for output files"
+  type        = string
+}
+
+variable "cloudfront_allowed_geos" {
+  description = "ISO 3166-1 alpha-2 country codes allowed to reach the CloudFront distribution. Empty (default) applies no geo restriction; a non-empty list becomes a whitelist, mirroring upstream CloudFrontAllowedGeos."
+  type        = list(string)
+  default     = []
+}
+
+variable "test_set_bucket_name" {
+  description = "Name of the Test Studio test-set bucket. Published to the Web UI as settings.TestSetBucket and given CORS, since the ground-truth editor reads and writes objects in it directly."
+  type        = string
+  default     = null
+}
+
+variable "test_set_bucket_enabled" {
+  description = "Whether the Test Studio test-set bucket exists, gating its CORS. Separate from test_set_bucket_name because that name is computed and unknown when planning from empty state."
+  type        = bool
+  default     = false
+}
+
+variable "working_bucket_arn" {
+  description = "ARN of the S3 bucket for intermediate working files. Optional; when set it receives the same CORS rules as the input and output buckets, because the file viewers can be handed presigned URLs for objects in it."
+  type        = string
+  default     = null
+}
+
+variable "working_bucket_cors_enabled" {
+  description = <<-EOT
+    Plan-time-known override for whether the working bucket exists and should
+    receive CORS rules. Callers typically pass `working_bucket_arn` as a COMPUTED
+    value (a bucket created in the same apply), so `working_bucket_arn != null`
+    is unknown at plan time and breaks a cold `terraform plan`. Set this to a
+    value the caller knows at plan time (e.g. "am I creating the working
+    bucket?"). Null (default) preserves the legacy behaviour of deriving the gate
+    from `working_bucket_arn != null`.
+  EOT
+  type        = bool
+  default     = null
+}
+
+
+variable "encryption_key_arn" {
+  description = "ARN of the KMS key for encryption"
+  type        = string
+}
+
+#
+# API Integration
+#
+variable "api_url" {
+  description = "Base URL of the REST API transport for the processing environment (VITE_API_BASE_URL). The SPA POSTs to <api_url>/op/<field>. Formerly the AppSync GraphQL endpoint (VITE_APPSYNC_GRAPHQL_URL) before the v0.6.4 REST migration; the input name is retained."
+  type        = string
+}
+
+variable "stream_url" {
+  description = "Function URL of the chat token-streaming endpoint (VITE_STREAM_URL). Null (default) when chat streaming is disabled; rendered as an empty string in the UI config."
+  type        = string
+  default     = null
+}
+
+#
+# User Identity Integration
+#
+variable "user_identity" {
+  description = "The user identity management system that handles authentication and authorization"
+  type = object({
+    user_pool = object({
+      user_pool_id  = string
+      user_pool_arn = string
+      endpoint      = string
+    })
+    user_pool_client = object({
+      user_pool_client_id = string
+    })
+    identity_pool = object({
+      identity_pool_id       = string
+      authenticated_role_arn = string
+    })
+  })
+}
+
+#
+# Optional Infrastructure (when create_infrastructure = true)
+#
+variable "logging_bucket" {
+  description = "Optional S3 bucket for storing CloudFront and S3 access logs (only used when create_infrastructure is true)"
+  type = object({
+    bucket_name = string
+    bucket_arn  = string
+  })
+  default = null
+}
+
+#
+# Web UI Configuration
+#
+variable "should_allow_sign_up_email_domain" {
+  description = "Controls whether the UI allows users to sign up with any email domain"
+  type        = bool
+  default     = false
+}
+
+#
+# CloudFront Configuration (when create_infrastructure = true)
+#
+variable "enable_waf" {
+  description = "Enable WAF protection for CloudFront distribution (only used when create_infrastructure is true)"
+  type        = bool
+  default     = true
+}
+
+variable "waf_rate_limit" {
+  description = "Rate limit for WAF (requests per 5-minute period, only used when create_infrastructure is true)"
+  type        = number
+  default     = 2000
+}
+
+variable "custom_domain_name" {
+  description = "Custom domain name for CloudFront distribution (only used when create_infrastructure is true)"
+  type        = string
+  default     = null
+}
+
+variable "acm_certificate_arn" {
+  description = "ARN of ACM certificate for custom domain (must be in us-east-1, only used when create_infrastructure is true)"
+  type        = string
+  default     = null
+}
+
+#
+# Network Configuration (Optional)
+#
+variable "vpc_id" {
+  description = "ID of the VPC for network integration"
+  type        = string
+  default     = null
+}
+
+variable "subnet_ids" {
+  description = "List of subnet IDs for network integration"
+  type        = list(string)
+  default     = []
+}
+
+variable "security_group_ids" {
+  description = "List of security group IDs for network integration"
+  type        = list(string)
+  default     = []
+}
+
+#
+# Common Configuration
+#
+variable "lambda_tracing_mode" {
+  description = "X-Ray tracing mode for Lambda functions. Valid values: Active, PassThrough"
+  type        = string
+  default     = "Active"
+}
+
+variable "ui_local" {
+  description = "When true, build the web UI locally via npm instead of using AWS CodeBuild. Requires Node.js >= 18 on the deploy host."
+  type        = bool
+  default     = false
+}
+
+variable "tags" {
+  description = "Tags to apply to all resources"
+  type        = map(string)
+  default     = {}
+}
+
+variable "lambda_architecture" {
+  description = "Target Lambda architecture (x86_64 | arm64). Must match the architecture the idp_common layers were built for; mismatches break native deps (e.g. pydantic_core)."
+  type        = string
+  default     = "arm64"
+  validation {
+    condition     = contains(["x86_64", "arm64"], var.lambda_architecture)
+    error_message = "lambda_architecture must be one of: x86_64, arm64."
+  }
+}
+
+variable "external_idp" {
+  description = "External IdP details for the sign-in UI. When set, the build receives VITE_COGNITO_DOMAIN / VITE_EXTERNAL_IDP_NAME / VITE_EXTERNAL_IDP_AUTO_LOGIN so the UI renders a federated sign-in entry point. Null renders Cognito-only sign-in."
+  type = object({
+    provider_name  = string
+    cognito_domain = string
+    auto_login     = optional(bool, false)
+  })
+  default = null
+}
+
+variable "log_retention_days" {
+  description = "Log retention period in days"
+  type        = number
+  default     = 30
+  nullable    = false
+  validation {
+    condition     = contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653], var.log_retention_days)
+    error_message = "Log retention days must be one of the allowed values."
+  }
+}

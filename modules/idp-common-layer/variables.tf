@@ -1,0 +1,104 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+variable "lambda_layers_bucket_arn" {
+  description = "ARN of the S3 bucket for storing Lambda layers. If not provided, a new bucket will be created."
+  type        = string
+  default     = ""
+}
+
+variable "layer_prefix" {
+  description = "Prefix for the lambda layers (should be unique per deployment)"
+  type        = string
+  default     = "idp-common"
+
+  # Mirrors the validation on the same input in ../lambda-layer-codebuild-idp,
+  # so an invalid value is reported against the variable the caller actually set.
+  validation {
+    condition     = can(regex("^[A-Za-z0-9][A-Za-z0-9_-]*$", var.layer_prefix)) && length(var.layer_prefix) <= 50
+    error_message = "Variable layer_prefix must be 1-50 characters of letters, digits, hyphens, or underscores, and must begin with a letter or digit."
+  }
+}
+
+variable "idp_common_extras" {
+  description = "List of extra dependencies to include (e.g., ['ocr', 'classification', 'extraction'])"
+  type        = list(string)
+  default     = ["all"]
+}
+
+variable "force_rebuild" {
+  description = "Force rebuild of lambda layers regardless of requirements changes"
+  type        = bool
+  default     = false
+}
+
+variable "lambda_tracing_mode" {
+  description = "X-Ray tracing mode for Lambda functions. Valid values: Active, PassThrough"
+  type        = string
+  default     = "Active"
+
+  validation {
+    condition     = contains(["Active", "PassThrough"], var.lambda_tracing_mode)
+    error_message = "lambda_tracing_mode must be either 'Active' or 'PassThrough'."
+  }
+}
+
+#
+# Build strategy pass-through (see root var.build in variables.tf)
+#
+variable "lambda_local" {
+  description = "When true, build Lambda layers locally using a container runtime instead of via AWS CodeBuild. See root var.build.lambda_local."
+  type        = bool
+  default     = false
+}
+
+variable "lambda_architecture" {
+  description = "Target Lambda architecture. Propagates to compatible_architectures on the layer and to the local/CodeBuild build-host platform."
+  type        = string
+  default     = "arm64"
+
+  validation {
+    condition     = contains(["x86_64", "arm64"], var.lambda_architecture)
+    error_message = "lambda_architecture must be one of: x86_64, arm64."
+  }
+}
+
+variable "container_runtime" {
+  description = "Container runtime to use when lambda_local = true. \"auto\" probes docker -> podman -> finch."
+  type        = string
+  default     = "auto"
+
+  validation {
+    condition     = contains(["auto", "docker", "podman", "finch"], var.container_runtime)
+    error_message = "container_runtime must be one of: auto, docker, podman, finch."
+  }
+}
+
+variable "vpc_id" {
+  description = "VPC to place the layer-build CodeBuild project in, alongside subnet_ids and security_group_ids. Null builds outside a VPC."
+  type        = string
+  default     = null
+}
+
+variable "subnet_ids" {
+  description = "Subnets for the layer-build CodeBuild project. The build runs `pip install`, so these MUST have egress to the package index."
+  type        = list(string)
+  default     = []
+}
+
+variable "security_group_ids" {
+  description = "Security groups for the layer-build CodeBuild project. Must allow outbound HTTPS."
+  type        = list(string)
+  default     = []
+}
+
+variable "log_retention_days" {
+  description = "Log retention period in days"
+  type        = number
+  default     = 30
+  nullable    = false
+  validation {
+    condition     = contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653], var.log_retention_days)
+    error_message = "Log retention days must be one of the allowed values."
+  }
+}

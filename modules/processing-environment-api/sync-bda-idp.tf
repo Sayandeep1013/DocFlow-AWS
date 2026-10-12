@@ -1,0 +1,149 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# BDA Sync sub-feature (v0.4.10+)
+# Always-on — syncBdaIdp is a core API operation when BDA processor is used.
+# Sourced from the CDK nested appsync tree.
+
+# =============================================================================
+# IAM Role: sync_bda_idp
+# =============================================================================
+
+resource "aws_iam_role" "sync_bda_idp" {
+  name = "${local.api_name}-sync-bda-idp"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy" "sync_bda_idp" {
+  name = "sync-bda-idp-policy"
+  role = aws_iam_role.sync_bda_idp.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat([
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "arn:${data.aws_partition.current.partition}:logs:*:*:*"
+      },
+      {
+        # Bedrock Data Automation blueprint and project CRUD. The project
+        # actions are needed because the sync path calls
+        # get_or_create_project_for_version, which creates and updates a project
+        # rather than only reading one.
+        Effect = "Allow"
+        Action = [
+          "bedrock:CreateBlueprint",
+          "bedrock:CreateBlueprintVersion",
+          "bedrock:UpdateBlueprint",
+          "bedrock:DeleteBlueprint",
+          "bedrock:GetBlueprint",
+          "bedrock:ListBlueprints",
+          "bedrock:InvokeDataAutomationAsync",
+          "bedrock:CreateDataAutomationProject",
+          "bedrock:UpdateDataAutomationProject",
+          "bedrock:DeleteDataAutomationProject",
+          "bedrock:GetDataAutomationProject",
+          "bedrock:GetDataAutomationStatus",
+          "bedrock:ListDataAutomationProjects"
+        ]
+        Resource = "*"
+      },
+      {
+        # PutItem is required: get_or_create_project_for_version records the
+        # project link with put_item, and the caller swallows AccessDenied.
+        Effect   = "Allow"
+        Action   = ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:PutItem", "dynamodb:UpdateItem"]
+        Resource = compact([local.configuration_table_arn, "${local.configuration_table_arn}/index/*"])
+      },
+      {
+        Effect   = "Allow"
+        Action   = "cloudwatch:PutMetricData"
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey", "kms:DescribeKey"]
+        Resource = local.encryption_key_arn != null ? local.encryption_key_arn : "arn:${data.aws_partition.current.partition}:kms:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:key/00000000-0000-0000-0000-000000000000"
+      }
+      ],
+      # Users-table read backs the allowedConfigVersions scope check, which
+      # silently allows every version when the table is unreachable.
+      var.users_table_name != "" ? [{
+        Effect   = "Allow"
+        Action   = ["dynamodb:Query", "dynamodb:GetItem"]
+        Resource = [local.users_table_arn_prefix, "${local.users_table_arn_prefix}/index/*"]
+    }] : [])
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "sync_bda_idp_xray" {
+  role       = aws_iam_role.sync_bda_idp.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AWSXRayDaemonWriteAccess"
+}
+
+# =============================================================================
+# Lambda: sync_bda_idp
+# =============================================================================
+
+resource "aws_cloudwatch_log_group" "sync_bda_idp" {
+  name              = "/aws/lambda/${local.api_name}-sync-bda-idp"
+  retention_in_days = var.log_retention_days
+  kms_key_id        = local.encryption_key_arn
+  tags              = var.tags
+}
+
+data "archive_file" "sync_bda_idp" {
+  type        = "zip"
+  source_dir  = "${path.module}/../../sources/nested/api-resolvers/src/lambda/sync_bda_idp_resolver"
+  output_path = "${path.module}/../../.terraform/archives/sync_bda_idp.zip"
+}
+
+resource "aws_lambda_function" "sync_bda_idp" {
+  architectures    = [var.lambda_architecture]
+  function_name    = "${local.api_name}-sync-bda-idp"
+  role             = aws_iam_role.sync_bda_idp.arn
+  filename         = data.archive_file.sync_bda_idp.output_path
+  source_code_hash = data.archive_file.sync_bda_idp.output_base64sha256
+  handler          = "index.handler"
+  runtime          = "python3.12"
+  timeout          = 300
+  memory_size      = 512
+  layers           = compact([var.base_layer_arn, var.idp_common_layer_arn])
+
+  environment {
+    variables = {
+      LOG_LEVEL                = var.log_level
+      BDA_PROJECT_ARN          = var.bda_project_arn
+      CONFIGURATION_TABLE_NAME = local.configuration_table_name != null ? local.configuration_table_name : ""
+      USERS_TABLE_NAME         = var.users_table_name
+    }
+  }
+
+  tracing_config { mode = var.lambda_tracing_mode }
+
+  dynamic "vpc_config" {
+    for_each = var.vpc_config != null ? [var.vpc_config] : []
+    content {
+      subnet_ids         = vpc_config.value.subnet_ids
+      security_group_ids = vpc_config.value.security_group_ids
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.sync_bda_idp]
+  tags       = var.tags
+}
+
+# AppSync data source/resolver + invoke policy removed in the v0.6.4 REST
+# migration. syncBdaIdp is now routed to this Lambda by the dispatcher
+# (see dispatcher.tf field_function_map); the dispatcher role grants the invoke.

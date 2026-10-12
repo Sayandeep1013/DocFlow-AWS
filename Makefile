@@ -1,0 +1,296 @@
+# Makefile for GenAI IDP Accelerator Terraform
+# Based on AWS IA Terraform standards
+
+.PHONY: help install-tools fmt check-sources validate lint security docs unit-test test clean all
+
+# Default target
+help: ## Show this help message
+	@echo "GenAI IDP Accelerator - Terraform Development Commands"
+	@echo "====================================================="
+	@echo ""
+	@echo "Available targets:"
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@echo ""
+	@echo "Examples:"
+	@echo "  make install-tools  # Install all required tools"
+	@echo "  make all           # Run all validation checks"
+	@echo "  make fmt           # Format all Terraform files"
+	@echo "  make test          # Run all tests"
+
+# Tool installation
+install-tools: ## Install required development tools
+	@echo "Installing development tools..."
+	@command -v terraform >/dev/null 2>&1 || { echo "Please install Terraform: https://www.terraform.io/downloads"; exit 1; }
+	@command -v tflint >/dev/null 2>&1 || { echo "Installing tflint..."; curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash; }
+	@command -v tfsec >/dev/null 2>&1 || { echo "Installing tfsec..."; curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | sh; }
+	@command -v terraform-docs >/dev/null 2>&1 || { echo "Installing terraform-docs..."; curl -sSLo terraform-docs.tar.gz https://terraform-docs.io/dl/v0.17.0/terraform-docs-v0.17.0-$$(uname)-amd64.tar.gz && tar -xzf terraform-docs.tar.gz && sudo mv terraform-docs /usr/local/bin/ && rm terraform-docs.tar.gz; }
+	@command -v pre-commit >/dev/null 2>&1 || { echo "Installing pre-commit..."; pip install pre-commit; }
+	@echo "✅ All tools installed successfully"
+
+# Pre-commit setup
+setup-pre-commit: ## Setup pre-commit hooks
+	@echo "Setting up pre-commit hooks..."
+	@pre-commit install
+	@pre-commit install --hook-type commit-msg
+	@echo "✅ Pre-commit hooks installed"
+
+# Terraform formatting
+fmt: ## Format all Terraform files (excludes sources/ - upstream files synced 1:1)
+	@echo "Formatting Terraform files..."
+	@terraform fmt -recursive modules/
+	@terraform fmt -recursive examples/
+	@terraform fmt *.tf
+	@echo "✅ Terraform files formatted"
+
+# Source-path reconciliation check
+check-sources: ## Assert no .tf references a non-existent sources/ path (guards upstream re-snapshots)
+	@echo "Checking sources/ path references in Terraform files..."
+	@./scripts/check-sources-paths.sh
+
+# Terraform validation
+check-lambda-env: ## Assert every deployed Lambda's required env vars are set (guards upstream pin moves)
+	@echo "Checking Lambda environment variables..."
+	@python3 tests/check-lambda-env-vars.py
+
+check-field-coverage: ## Assert every upstream API field is servable (guards "unknown operation" regressions)
+	@echo "Checking dispatcher field coverage..."
+	@python3 tests/check-dispatcher-field-coverage.py
+
+validate: check-sources check-lambda-env check-field-coverage ## Validate all Terraform configurations
+	@echo "Validating Terraform configurations in modules..."
+	@failed=""; \
+	for dir in modules/*/ modules/processors/*/ modules/features/*/; do \
+		if [ -f "$$dir/main.tf" ] || [ -f "$$dir/versions.tf" ]; then \
+			if [ "$$dir" = "modules/web-ui/" ]; then \
+				echo "Skipping $$dir (requires aws.us-east-1 provider alias - validated via examples instead)"; \
+				continue; \
+			fi; \
+			echo "Validating $$dir"; \
+			if ! ( cd "$$dir" && terraform init -backend=false -input=false > /dev/null && terraform validate ); then \
+				failed="$$failed $$dir"; \
+			fi; \
+		fi; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		echo "❌ Terraform validation FAILED:"; \
+		for f in $$failed; do echo "   $$f"; done; \
+		exit 1; \
+	fi; \
+	echo "✅ All Terraform module configurations are valid"
+
+# TFLint
+lint: ## Run TFLint on all Terraform files
+	@echo "Running TFLint on modules..."
+	@tflint --init
+	@for dir in modules/*/; do \
+		if [ -f "$$dir/main.tf" ] || [ -f "$$dir/versions.tf" ]; then \
+			echo "Linting $$dir"; \
+			if [ -f "$$dir/.tflint.hcl" ]; then \
+				cd "$$dir" && tflint --minimum-failure-severity=error && cd - > /dev/null; \
+			else \
+				cd "$$dir" && tflint --minimum-failure-severity=error --config="$(CURDIR)/.tflint.hcl" && cd - > /dev/null; \
+			fi; \
+		fi; \
+	done
+	@echo "✅ TFLint checks completed"
+
+# TFSec security scanning
+#
+# Modules with KNOWN PRE-EXISTING tfsec findings that predate the v0.5.12 work.
+# They are scanned with --soft-fail so their findings are still PRINTED (never
+# masked) but do not fail the gate, keeping the gate scoped to regressions.
+# Remediating these is tracked as separate security-hardening debt. Every module
+# NOT listed here is scanned strictly, so a new finding in current work fails the
+# build.
+#
+# Note: processing-environment-api's findings (conditional DynamoDB SSE on the
+# agent-companion-chat / test-studio tables, a Step Functions DescribeExecution
+# wildcard, and S3 access-logging) are long-standing but were previously hidden
+# because tfsec 1.28.x aborts on the Terraform `removed {}` blocks the module
+# used to carry; with those gone the scan now surfaces them.
+TFSEC_KNOWN_DEBT_MODULES := \
+	modules/assets-bucket \
+	modules/web-ui \
+	modules/user-identity \
+	modules/reporting \
+	modules/features/chat-with-document \
+	modules/processing-environment-api \
+	modules/processing-environment-api/agent-analytics \
+	modules/processing-environment-api/discovery \
+	modules/processors/bda-processor \
+	modules/processors/bedrock-llm-processor \
+	modules/processors/sagemaker-udop-processor \
+	modules/processors/unified-processor
+
+security: ## Run TFSec security scan
+	@echo "Running TFSec security scan (per-module; excludes examples/ and sources/)..."
+	@# tfsec 1.28.x cannot parse Terraform 1.5+ check{} or removed{} blocks: such a
+	@# block anywhere in a scanned root module is a FATAL parse error that aborts the
+	@# whole scan BEFORE result filtering, so --exclude-path on an individual file does
+	@# NOT prevent it (the flag only filters findings, it does not skip parsing). The
+	@# repo root (main.tf/features.tf/network.tf carry check{}) and
+	@# modules/processing-environment-api/error-analyzer.tf (removed{}) all trip this.
+	@# The repo root holds no scannable resources beyond already-excluded IAM glue, so
+	@# the real resource surface lives in modules/. We therefore scan each module
+	@# directory individually (the form of exclusion that actually works in 1.28.x) and
+	@# skip the directories whose .tf files contain check{}/removed{} blocks, which are
+	@# validation/state-migration glue with no scannable resources of their own.
+	@# build-runtime-check/main.tf also uses check{} (added by local-lambda-build).
+	@set -e; \
+	for dir in $$(find modules -name main.tf -exec dirname {} \; | sort -u); do \
+		if grep -qE '^[[:space:]]*(check|removed)[[:space:]]' "$$dir"/*.tf 2>/dev/null; then \
+			echo "Skipping $$dir (Terraform 1.5+ check{}/removed{} blocks - tfsec 1.28.x parse limitation)"; \
+			continue; \
+		fi; \
+		case " $(TFSEC_KNOWN_DEBT_MODULES) " in \
+			*" $${dir%/} "*) \
+				echo "Scanning $$dir (known pre-existing debt - soft-fail, findings shown but non-blocking)"; \
+				tfsec "$$dir" --config-file .tfsec/config.yml --soft-fail;; \
+			*) \
+				echo "Scanning $$dir (strict)"; \
+				tfsec "$$dir" --config-file .tfsec/config.yml;; \
+		esac; \
+	done
+	@echo "✅ Security scan completed"
+
+# Generate documentation
+docs: ## Generate Terraform documentation
+	@command -v terraform-docs >/dev/null 2>&1 || { echo "terraform-docs not found. Run 'make install-tools' or see https://terraform-docs.io"; exit 1; }
+	@echo "Generating Terraform documentation for modules..."
+	@# Render to a temp file and move it into place only on success: redirecting
+	@# straight into README.md truncates it before terraform-docs runs, so any
+	@# failure leaves the file empty. The cd stays (terraform-docs only reports
+	@# resolved provider versions when run inside the initialized module dir) but
+	@# runs in a subshell, so a failure cannot leak the working directory into the
+	@# next iteration. The second glob picks up nested modules
+	@# (modules/processors/*), which the single-level glob never reached.
+	@set -e; for dir in modules/*/ modules/*/*/; do \
+		if [ -f "$$dir/main.tf" ]; then \
+			echo "Generating docs for $$dir"; \
+			tmp=$$(mktemp); \
+			( cd "$$dir" && terraform-docs markdown table . ) > "$$tmp"; \
+			mv "$$tmp" "$$dir/README.md"; \
+		fi; \
+	done
+	@echo "✅ Documentation generated"
+
+# Native `terraform test` suites. Module dirs are derived from the test files
+# themselves, so nested modules (modules/features/*, modules/processors/*) are
+# covered too -- unlike validate/lint, which only walk modules/*/.
+#
+# One `terraform test` process PER TEST FILE, not per module. `terraform test`
+# holds every run in a file for the life of the process, and each run here is a
+# full `command = plan` of the module, so a module with many runs in one file
+# grew past the shared CI runner's container memory limit and was OOM-killed
+# (exit 137). A process per file releases that memory at each file boundary.
+# `init` still runs once per module, so this costs no extra provider downloads.
+unit-test: ## Run every module's native `terraform test` suite (one process per test file)
+	@echo "Running terraform test suites..."
+	@failed=""; \
+	for dir in $$(find modules -name '*.tftest.hcl' -not -path '*/.terraform/*' | sed 's|/tests/.*||' | sort -u); do \
+		echo "--- $$dir"; \
+		if ! (cd "$$dir" && terraform init -backend=false -input=false > /dev/null); then \
+			failed="$$failed $$dir(init)"; \
+			continue; \
+		fi; \
+		for tf in $$(cd "$$dir" && find tests -name '*.tftest.hcl' -not -path '*/.terraform/*' | sort); do \
+			echo "    $$tf"; \
+			if ! (cd "$$dir" && terraform test -filter="$$tf"); then \
+				failed="$$failed $$dir/$$tf"; \
+			fi; \
+		done; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		echo "❌ terraform test failed in:$$failed"; \
+		exit 1; \
+	fi; \
+	echo "✅ All terraform test suites passed"
+
+# Run all tests
+test: fmt validate lint security unit-test ## Run all validation tests
+	@echo "✅ All tests passed!"
+
+# End-to-end tests against a live, pre-deployed Terraform stack. Opt-in (needs
+# AWS creds + a deployed stack). Point at the deployment with IDP_TF_DIR and
+# IDP_TF_WORKSPACE. See tests/e2e/README.md.
+IDP_TF_DIR ?= $(CURDIR)/examples/unified-processor
+test-e2e: ## Run end-to-end tests against a deployed stack (requires AWS + IDP_TF_DIR/IDP_TF_WORKSPACE)
+	@echo "Running E2E tests against $(IDP_TF_DIR) (workspace: $${IDP_TF_WORKSPACE:-current})..."
+	IDP_TF_DIR="$(IDP_TF_DIR)" python3 -m pytest tests/e2e -m e2e -p no:cacheprovider
+
+# Clean temporary files
+clean: ## Clean temporary files and directories
+	@echo "Cleaning temporary files..."
+	@find . -type d -name ".terraform" -exec rm -rf {} + 2>/dev/null || true
+	@find . -name "*.tfplan" -delete 2>/dev/null || true
+	@find . -name "*.tfstate*" -delete 2>/dev/null || true
+	@find . -name ".terraform.lock.hcl" -delete 2>/dev/null || true
+	@echo "✅ Cleanup completed"
+
+# Clean untracked files with exclusions
+clean-soft: ## Clean untracked files while preserving important patterns
+	@echo "Cleaning untracked files (preserving important patterns)..."
+	@git clean -fdn -e "*.tfvars" -e ".terraform/" -e "*.tfstate*" -e ".terraform.lock.hcl"
+	@echo ""
+	@echo "⚠️  This is a dry run. To actually delete these files, run:"
+	@echo "    git clean -fd -e \"*.tfvars\" -e \".terraform/\" -e \"*.tfstate*\" -e \".terraform.lock.hcl\""
+	@echo ""
+	@echo "Or use:"
+	@echo "    make clean-soft-force"
+	@echo ""
+
+clean-soft-force: ## Force clean untracked files while preserving important patterns
+	@echo "Force cleaning untracked files (preserving important patterns)..."
+	@git clean -fd -e "*.tfvars" -e ".terraform/" -e "*.tfstate*" -e ".terraform.lock.hcl"
+	@echo "✅ Soft cleanup completed"
+
+# Run all checks (CI equivalent)
+all: fmt validate lint security unit-test docs ## Run all checks (equivalent to CI pipeline)
+	@echo "🎉 All quality checks passed! Ready for merge."
+
+# Check specific module
+check-module: ## Check specific module (usage: make check-module MODULE=modules/web-ui)
+	@if [ -z "$(MODULE)" ]; then echo "Usage: make check-module MODULE=modules/web-ui"; exit 1; fi
+	@echo "Checking module: $(MODULE)"
+	@cd "$(MODULE)" && terraform fmt -check
+	@cd "$(MODULE)" && terraform init -backend=false && terraform validate
+	@cd "$(MODULE)" && tflint --config="$(CURDIR)/.tflint.hcl"
+	@tfsec "$(MODULE)" --config-file .tfsec/config.yml
+	@echo "✅ Module $(MODULE) passed all checks"
+
+# Check specific example
+check-example: ## Check specific example (usage: make check-example EXAMPLE=examples/bedrock-llm-processor)
+	@if [ -z "$(EXAMPLE)" ]; then echo "Usage: make check-example EXAMPLE=examples/bedrock-llm-processor"; exit 1; fi
+	@echo "Checking example: $(EXAMPLE)"
+	@cd "$(EXAMPLE)" && terraform fmt -check
+	@cd "$(EXAMPLE)" && terraform init -backend=false && terraform validate
+	@cd "$(EXAMPLE)" && tflint --config="$(CURDIR)/.tflint.hcl"
+	@tfsec "$(EXAMPLE)" --config-file .tfsec/config.yml
+	@echo "✅ Example $(EXAMPLE) passed all checks"
+
+# Initialize new module
+init-module: ## Initialize new module structure (usage: make init-module MODULE=my-new-module)
+	@if [ -z "$(MODULE)" ]; then echo "Usage: make init-module MODULE=my-new-module"; exit 1; fi
+	@echo "Creating new module: modules/$(MODULE)"
+	@mkdir -p "modules/$(MODULE)"
+	@echo "# $(MODULE) Module\n\nTODO: Add module description\n\n## Usage\n\n\`\`\`hcl\nmodule \"$(MODULE)\" {\n  source = \"./modules/$(MODULE)\"\n  # Add variables here\n}\n\`\`\`" > "modules/$(MODULE)/README.md"
+	@touch "modules/$(MODULE)/main.tf"
+	@touch "modules/$(MODULE)/variables.tf"
+	@touch "modules/$(MODULE)/outputs.tf"
+	@touch "modules/$(MODULE)/versions.tf"
+	@echo "✅ Module modules/$(MODULE) created successfully"
+
+# Show current status
+status: ## Show current repository status
+	@echo "Repository Status"
+	@echo "================="
+	@echo "Branch: $$(git branch --show-current)"
+	@echo "Terraform version: $$(terraform version -json | jq -r '.terraform_version')"
+	@echo "TFLint version: $$(tflint --version | head -n1)"
+	@echo "TFSec version: $$(tfsec --version | head -n1)"
+	@echo ""
+	@echo "Modules:"
+	@find modules -name "main.tf" -exec dirname {} \; | sort
+	@echo ""
+	@echo "Examples:"
+	@find examples -name "main.tf" -exec dirname {} \; | sort

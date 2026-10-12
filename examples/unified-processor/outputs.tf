@@ -1,0 +1,140 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+output "input_bucket" {
+  description = "S3 bucket for input documents. Upload here with config-version metadata to route."
+  value = {
+    name = aws_s3_bucket.input_bucket.id
+    arn  = aws_s3_bucket.input_bucket.arn
+  }
+}
+
+output "output_bucket" {
+  description = "S3 bucket for processed output documents"
+  value = {
+    name = aws_s3_bucket.output_bucket.id
+    arn  = aws_s3_bucket.output_bucket.arn
+  }
+}
+
+output "working_bucket" {
+  description = "S3 bucket for working files"
+  value = {
+    name = aws_s3_bucket.working_bucket.id
+    arn  = aws_s3_bucket.working_bucket.arn
+  }
+}
+
+output "encryption_key" {
+  description = "KMS key for encryption"
+  value = {
+    id  = aws_kms_key.encryption_key.id
+    arn = aws_kms_key.encryption_key.arn
+  }
+}
+
+output "config_versions" {
+  description = "Configuration versions seeded on this deployment and their routing branch."
+  value = {
+    default                = "Bedrock-LLM - upload with config-version=default"
+    (var.bda_version_name) = "BDA - upload with config-version=${var.bda_version_name}"
+  }
+}
+
+output "bda_config_version" {
+  description = "Name of the BDA-linked configuration version. Tag an upload with config-version=<this> to route it through the BDA branch."
+  value       = var.bda_version_name
+}
+
+output "bda_project_arn" {
+  description = "BDA project ARN linked to the BDA configuration version (empty if unlinked)."
+  # Created project (create_bda_project) or the passed-in var.bda_project_arn.
+  value = local.effective_bda_project_arn
+}
+
+output "knowledge_base_id" {
+  description = "ID of the optional Bedrock Knowledge Base (null when create_knowledge_base = false)."
+  value       = local.knowledge_base_enabled ? aws_bedrockagent_knowledge_base.knowledge_base[0].id : null
+}
+
+output "knowledge_base_arn" {
+  description = "ARN of the optional Bedrock Knowledge Base (null when create_knowledge_base = false)."
+  value       = local.knowledge_base_enabled ? aws_bedrockagent_knowledge_base.knowledge_base[0].arn : null
+}
+
+output "web_ui_url" {
+  description = "Web UI URL (if enabled)"
+  value       = var.web_ui.enabled ? module.genai_idp_accelerator.web_ui.url : null
+}
+
+output "name_prefix" {
+  description = "Name prefix used for all resources"
+  value       = module.genai_idp_accelerator.name_prefix
+}
+
+output "processor_type" {
+  description = "Type of document processor used"
+  value       = module.genai_idp_accelerator.processor_type
+}
+
+output "step_function_arn" {
+  description = "ARN of the single Step Functions state machine that routes both branches"
+  value       = module.genai_idp_accelerator.processor.state_machine_arn
+}
+
+output "configuration_table_arn" {
+  description = "ARN of the DynamoDB table that stores configuration versions (incl. BdaProjectArn)"
+  value       = module.genai_idp_accelerator.processing_environment.configuration_table_arn
+}
+
+# ----------------------------------------------------------------------------
+# E2E test surface
+#
+# A single object the ported end-to-end test harness reads via
+# `terraform output -json e2e_stack`. It maps this deployment's resources to the
+# friendly names the upstream idp_sdk integration tests expect, so those tests
+# can target the Terraform stack instead of a CloudFormation stack. Test-only;
+# does not affect the deployed infrastructure.
+# ----------------------------------------------------------------------------
+output "e2e_stack" {
+  description = "Resource handles for the end-to-end test harness (see tests/e2e)."
+  value = {
+    region              = var.region
+    name_prefix         = module.genai_idp_accelerator.name_prefix
+    input_bucket        = aws_s3_bucket.input_bucket.id
+    output_bucket       = aws_s3_bucket.output_bucket.id
+    working_bucket      = aws_s3_bucket.working_bucket.id
+    state_machine_arn   = module.genai_idp_accelerator.processor.state_machine_arn
+    configuration_table = element(split("/", module.genai_idp_accelerator.processing_environment.configuration_table_arn), 1)
+    documents_table     = element(split("/", module.genai_idp_accelerator.processing_environment.tracking_table_arn), 1)
+    document_queue_arn  = module.genai_idp_accelerator.processing_environment.document_queue_arn
+    api_base_url        = try(module.genai_idp_accelerator.api.api_base_url, null)
+    user_pool_id        = try(module.genai_idp_accelerator.user_identity.user_pool_id, null)
+    user_pool_client_id = try(module.genai_idp_accelerator.user_identity.user_pool_client_id, null)
+    web_ui_url          = var.web_ui.enabled ? module.genai_idp_accelerator.web_ui.url : null
+    knowledge_base_id   = local.knowledge_base_enabled ? aws_bedrockagent_knowledge_base.knowledge_base[0].id : null
+    # Config version that routes to the BDA branch, and the project it is linked
+    # to. An EMPTY bda_project_arn means the version is seeded unlinked, so
+    # queue_processor clears use_bda and the document silently degrades to the
+    # Bedrock-LLM branch — the UI suite skips its BDA spec on that rather than
+    # passing a test that proves nothing.
+    bda_config_version = var.bda_version_name
+    bda_project_arn    = local.effective_bda_project_arn
+    # Non-empty only when discovery is enabled; this is exactly the value that
+    # feeds the Web UI's DiscoveryBucket setting (empty -> the UI shows
+    # "Discovery bucket not configured"). The e2e suite asserts it is populated
+    # when create_discovery = true.
+    discovery_bucket = try(module.genai_idp_accelerator.api.discovery_bucket_name, null)
+    # Classes each seeded config version declares, read from the config files
+    # themselves. The suites assert a classification against the version they
+    # uploaded as: a sample sent as the wrong version does not fail, it silently
+    # extracts every field as null.
+    document_classes = merge(
+      { default = compact([for c in try(local.config.classes, []) : try(c["x-aws-idp-document-type"], null)]) },
+      {
+        for name, cfg in local.additional_configurations :
+        name => compact([for c in try(cfg.classes, []) : try(c["x-aws-idp-document-type"], null)])
+      }
+    )
+  }
+}

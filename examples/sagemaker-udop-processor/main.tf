@@ -1,0 +1,613 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+/**
+ * # SageMaker UDOP Processor Example with Web UI
+ *
+ * This example demonstrates how to use the SageMaker UDOP processor from the GenAI IDP Accelerator
+ * with the integrated Web UI. It creates all the necessary resources including S3 buckets, KMS key,
+ * and uses the top-level module to deploy the complete solution with the SageMaker UDOP processor.
+ */
+
+provider "aws" {
+  region = var.region
+}
+
+provider "aws" {
+  alias  = "us-east-1"
+  region = "us-east-1"
+}
+
+provider "awscc" {
+  region = var.region
+}
+
+# OpenSearch provider for the optional Knowledge Base vector index. When the KB
+# is disabled, the collection isn't created, so point at a harmless placeholder
+# URL and skip the healthcheck (mirrors examples/unified-processor).
+provider "opensearch" {
+  url         = local.knowledge_base_enabled ? aws_opensearchserverless_collection.knowledge_base_collection[0].collection_endpoint : "https://placeholder.us-east-1.es.amazonaws.com"
+  aws_region  = var.region
+  healthcheck = false
+}
+
+# Data sources
+data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
+data "aws_region" "current" {}
+
+# Create a random string for unique resource names
+resource "random_string" "suffix" {
+  length  = 8
+  special = false
+  upper   = false
+}
+
+# Local values
+locals {
+  name_prefix = "${var.prefix}-${random_string.suffix.result}"
+
+  rbac_enabled     = try(var.rbac.enabled, false)
+  admin_group_name = local.rbac_enabled ? try(module.genai_idp_accelerator.rbac_group_names["Admin"], "Admin") : one(aws_cognito_user_group.admin_group[*].name)
+
+  # Knowledge Base backend (default on; see knowledge-base.tf). Gates the whole
+  # OpenSearch Serverless + Bedrock Knowledge Base stack.
+  knowledge_base_enabled = var.create_knowledge_base
+
+  # Embedding model id used by knowledge-base.tf for the KB IAM policy and the
+  # collection's embedding_model_arn. Must match the vector index dimension.
+  knowledge_base_embedding_model_id = var.knowledge_base_embedding_model_id
+}
+
+# Create KMS key for encryption
+resource "aws_kms_key" "encryption_key" {
+  description             = "KMS key for IDP Processing Environment"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "Enable IAM User Permissions"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action   = "kms:*"
+        Resource = "*"
+      },
+      {
+        Sid    = "Allow CloudWatch Logs"
+        Effect = "Allow"
+        Principal = {
+          Service = "logs.${data.aws_region.current.region}.amazonaws.com"
+        }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
+        Condition = {
+          ArnEquals = {
+            "kms:EncryptionContext:aws:logs:arn" = "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:*"
+          }
+        }
+      }
+    ]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_kms_alias" "encryption_key" {
+  name          = "alias/idp-sagemaker-udop-${random_string.suffix.result}"
+  target_key_id = aws_kms_key.encryption_key.key_id
+}
+
+# Create S3 buckets for document processing
+resource "aws_s3_bucket" "input_bucket" {
+  bucket        = "${var.prefix}-input-${random_string.suffix.result}"
+  force_destroy = true
+  tags          = var.tags
+}
+
+resource "aws_s3_bucket" "output_bucket" {
+  bucket        = "${var.prefix}-output-${random_string.suffix.result}"
+  force_destroy = true
+  tags          = var.tags
+}
+
+resource "aws_s3_bucket" "working_bucket" {
+  bucket        = "${var.prefix}-working-${random_string.suffix.result}"
+  force_destroy = true
+  tags          = var.tags
+}
+
+# Block all public access on the document buckets (Wiz S3-046 public read,
+# S3-047 public write). These buckets are only accessed by the IDP pipeline and
+# the UI via presigned URLs / IAM — they must never be public.
+resource "aws_s3_bucket_public_access_block" "input_bucket" {
+  bucket                  = aws_s3_bucket.input_bucket.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_public_access_block" "output_bucket" {
+  bucket                  = aws_s3_bucket.output_bucket.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_public_access_block" "working_bucket" {
+  bucket                  = aws_s3_bucket.working_bucket.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# Optional buckets (created conditionally)
+# The root module creates the access-log bucket when web_ui.logging_enabled is set.
+
+resource "aws_s3_bucket" "evaluation_baseline_bucket" {
+  count         = var.enable_evaluation ? 1 : 0
+  bucket        = "${var.prefix}-evaluation-baseline-${random_string.suffix.result}"
+  force_destroy = true
+  tags          = var.tags
+}
+
+resource "aws_s3_bucket" "reporting_bucket" {
+  count         = var.enable_reporting ? 1 : 0
+  bucket        = "${var.prefix}-reporting-${random_string.suffix.result}"
+  force_destroy = true
+  tags          = var.tags
+}
+
+# Optional: Create Glue database for reporting if reporting is enabled
+resource "aws_glue_catalog_database" "reporting_database" {
+  count       = var.enable_reporting ? 1 : 0
+  name        = "${var.prefix}-reporting-database-${random_string.suffix.result}"
+  description = "Database containing tables for evaluation metrics and document processing analytics"
+  tags        = var.tags
+}
+
+# Enable EventBridge notifications on input bucket (required for processor to work).
+#
+# Terraform allows only ONE aws_s3_bucket_notification per bucket, so the optional
+# Knowledge Base ingestion Lambda trigger is folded in here via a dynamic block
+# (rather than a second notification resource). When create_knowledge_base is
+# false the dynamic block emits nothing and this is just the EventBridge hook.
+resource "aws_s3_bucket_notification" "input_bucket_notification" {
+  bucket      = aws_s3_bucket.input_bucket.id
+  eventbridge = true
+
+  dynamic "lambda_function" {
+    for_each = local.knowledge_base_enabled ? [1] : []
+    content {
+      lambda_function_arn = aws_lambda_function.knowledge_base_ingestion[0].arn
+      events              = ["s3:ObjectCreated:Put"]
+    }
+  }
+
+  depends_on = [aws_lambda_permission.allow_s3_invoke]
+}
+
+#
+# Cognito User Identity Resources
+#
+
+# Cognito User Pool
+resource "aws_cognito_user_pool" "user_pool" {
+  name                     = "${local.name_prefix}-user-pool"
+  auto_verified_attributes = ["email"]
+  deletion_protection      = "INACTIVE" # Disabled for examples
+
+  password_policy {
+    minimum_length                   = 8
+    require_lowercase                = true
+    require_numbers                  = true
+    require_symbols                  = true
+    require_uppercase                = true
+    temporary_password_validity_days = 7
+  }
+
+  user_pool_add_ons {
+    advanced_security_mode = "ENFORCED"
+  }
+
+  account_recovery_setting {
+    recovery_mechanism {
+      name     = "verified_email"
+      priority = 1
+    }
+  }
+
+  schema {
+    attribute_data_type = "String"
+    name                = "email"
+    required            = true
+    mutable             = true
+  }
+
+  admin_create_user_config {
+    allow_admin_create_user_only = true
+    invite_message_template {
+      email_message = "Your username is {username} and temporary password is {####}. Please sign in and change your password."
+      email_subject = "Your temporary password for GenAI IDP Accelerator"
+      sms_message   = "Your username is {username} and temporary password is {####}"
+    }
+  }
+
+  tags = {
+    Name = "${local.name_prefix}-user-pool"
+  }
+}
+
+# REGIONAL WAF Web ACL on the Cognito user pool (Wiz IDP-007). This example
+# creates its own user pool (rather than the user-identity module), so the WAF
+# is attached here to the example-local pool.
+resource "aws_wafv2_web_acl" "cognito" {
+  name  = "${local.name_prefix}-cognito-waf"
+  scope = "REGIONAL"
+
+  default_action {
+    allow {}
+  }
+
+  rule {
+    name     = "AWSManagedRulesCommonRuleSet"
+    priority = 1
+    override_action {
+      none {}
+    }
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesCommonRuleSet"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${local.name_prefix}-cognito-common"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${local.name_prefix}-cognito-waf"
+    sampled_requests_enabled   = true
+  }
+
+  tags = var.tags
+}
+
+resource "aws_wafv2_web_acl_association" "cognito" {
+  resource_arn = aws_cognito_user_pool.user_pool.arn
+  web_acl_arn  = aws_wafv2_web_acl.cognito.arn
+}
+
+# Cognito User Pool Client
+resource "aws_cognito_user_pool_client" "user_pool_client" {
+  name         = "${local.name_prefix}-user-pool-client"
+  user_pool_id = aws_cognito_user_pool.user_pool.id
+
+  allowed_oauth_flows                  = ["code"]
+  allowed_oauth_flows_user_pool_client = true
+  # Federated sign-in fails with invalid_scope without "phone".
+  allowed_oauth_scopes         = ["email", "openid", "phone", "profile"]
+  callback_urls                = ["http://localhost:3000"]
+  logout_urls                  = ["http://localhost:3000"]
+  supported_identity_providers = ["COGNITO"]
+
+  access_token_validity  = 60
+  id_token_validity      = 60
+  refresh_token_validity = 30
+
+  token_validity_units {
+    access_token  = "minutes"
+    id_token      = "minutes"
+    refresh_token = "days"
+  }
+
+  generate_secret = false
+
+  explicit_auth_flows = [
+    "ALLOW_ADMIN_USER_PASSWORD_AUTH",
+    "ALLOW_CUSTOM_AUTH",
+    "ALLOW_USER_PASSWORD_AUTH",
+    "ALLOW_USER_SRP_AUTH",
+    "ALLOW_REFRESH_TOKEN_AUTH"
+  ]
+}
+
+# Cognito Identity Pool
+resource "aws_cognito_identity_pool" "identity_pool" {
+  identity_pool_name               = "${local.name_prefix}-identity-pool"
+  allow_unauthenticated_identities = false
+
+  cognito_identity_providers {
+    client_id               = aws_cognito_user_pool_client.user_pool_client.id
+    provider_name           = aws_cognito_user_pool.user_pool.endpoint
+    server_side_token_check = false
+  }
+
+  tags = {
+    Name = "${local.name_prefix}-identity-pool"
+  }
+}
+
+# IAM role for authenticated users
+resource "aws_iam_role" "authenticated_role" {
+  name = "${local.name_prefix}-authenticated-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Federated = "cognito-identity.amazonaws.com"
+        }
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            "cognito-identity.amazonaws.com:aud" = aws_cognito_identity_pool.identity_pool.id
+          }
+          "ForAnyValue:StringLike" = {
+            "cognito-identity.amazonaws.com:amr" = "authenticated"
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${local.name_prefix}-authenticated-role"
+  }
+}
+
+# IAM role for unauthenticated users
+resource "aws_iam_role" "unauthenticated_role" {
+  name = "${local.name_prefix}-unauthenticated-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Federated = "cognito-identity.amazonaws.com"
+        }
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringEquals = {
+            "cognito-identity.amazonaws.com:aud" = aws_cognito_identity_pool.identity_pool.id
+          }
+          "ForAnyValue:StringLike" = {
+            "cognito-identity.amazonaws.com:amr" = "unauthenticated"
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${local.name_prefix}-unauthenticated-role"
+  }
+}
+
+# Attach roles to identity pool
+resource "aws_cognito_identity_pool_roles_attachment" "identity_pool_roles" {
+  identity_pool_id = aws_cognito_identity_pool.identity_pool.id
+
+  roles = {
+    "authenticated"   = aws_iam_role.authenticated_role.arn
+    "unauthenticated" = aws_iam_role.unauthenticated_role.arn
+  }
+}
+
+# Admin user creation (optional, externalized from the module)
+resource "aws_cognito_user" "admin_user" {
+  count        = var.admin_email != null && var.admin_email != "" ? 1 : 0
+  user_pool_id = aws_cognito_user_pool.user_pool.id
+  username     = var.admin_email
+
+  desired_delivery_mediums = ["EMAIL"]
+
+  attributes = {
+    email          = var.admin_email
+    email_verified = "true"
+    given_name     = "Admin"
+    family_name    = "User"
+  }
+
+  # Send invitation email with temporary password
+  # message_action = "SUPPRESS" # Removed to allow invitation email
+
+  lifecycle {
+    ignore_changes = [
+      password,
+      temporary_password
+    ]
+  }
+}
+
+# Admin group creation (optional)
+resource "aws_cognito_user_group" "admin_group" {
+  count        = var.admin_email != null && var.admin_email != "" && !local.rbac_enabled ? 1 : 0
+  name         = "Admin"
+  user_pool_id = aws_cognito_user_pool.user_pool.id
+  description  = "Administrators"
+  precedence   = 0
+}
+
+# Add admin user to admin group
+resource "aws_cognito_user_in_group" "admin_user_in_group" {
+  count        = var.admin_email != null && var.admin_email != "" ? 1 : 0
+  user_pool_id = aws_cognito_user_pool.user_pool.id
+  group_name   = local.admin_group_name
+  username     = aws_cognito_user.admin_user[0].username
+
+  # With RBAC on, the group is created inside the module, but rbac_group_names is
+  # derived from variables (to avoid a cycle), so nothing else orders us after it.
+  depends_on = [module.genai_idp_accelerator]
+}
+
+# Create and train the SageMaker UDOP model
+module "sagemaker_model" {
+  source = "./sagemaker-model"
+
+  log_retention_days = var.log_retention_days
+
+  name_prefix   = local.name_prefix
+  kms_key_id    = aws_kms_key.encryption_key.key_id
+  max_epochs    = var.training_config.max_epochs
+  base_model    = var.training_config.base_model
+  retrain_model = var.training_config.retrain_model
+
+  tags = var.tags
+}
+
+# Read configuration from config library (pattern-3 for SageMaker UDOP processor)
+locals {
+  config_file_path = var.config_file_path
+  config_yaml      = file(local.config_file_path)
+  config           = yamldecode(local.config_yaml)
+
+  # Additional config versions, managed from terraform.tfvars as
+  # version_name => path-to-YAML. Each becomes an editable, non-active version
+  # in the UI. Paths are relative to this example dir (or absolute). tfvars
+  # cannot call yamldecode/file, so the decode happens here.
+  additional_configurations = {
+    for name, p in var.additional_config_files :
+    name => yamldecode(file(startswith(p, "/") ? p : "${path.module}/${p}"))
+  }
+}
+
+# Deploy the GenAI IDP Accelerator with SageMaker UDOP processor
+module "genai_idp_accelerator" {
+  source = "../.."
+
+  providers = {
+    aws.us-east-1 = aws.us-east-1
+  }
+
+  # Processor configuration (per-stage models come from the config YAML)
+  processor = {
+    type                        = "sagemaker-udop"
+    classification_endpoint_arn = aws_sagemaker_endpoint.udop_endpoint.arn
+    # Summarization enablement + model come from the config YAML.
+    config                    = local.config
+    additional_configurations = local.additional_configurations
+  }
+
+  # Use external user identity instead of creating new one
+  user_identity = {
+    user_pool_arn          = aws_cognito_user_pool.user_pool.arn
+    user_pool_client_id    = aws_cognito_user_pool_client.user_pool_client.id
+    identity_pool_id       = aws_cognito_identity_pool.identity_pool.id
+    authenticated_role_arn = aws_iam_role.authenticated_role.arn
+  }
+
+  # Resource ARNs
+  input_bucket_arn   = aws_s3_bucket.input_bucket.arn
+  output_bucket_arn  = aws_s3_bucket.output_bucket.arn
+  working_bucket_arn = aws_s3_bucket.working_bucket.arn
+  encryption_key_arn = aws_kms_key.encryption_key.arn
+
+  # Evaluation configuration (model comes from the config YAML)
+  # Evaluation enablement is config-authoritative (config.evaluation.enabled);
+  # this example owns the baseline-bucket infra via var.enable_evaluation.
+  evaluation = {
+    # Static opt-in; the ARN below is computed and cannot gate count/for_each.
+    enabled             = var.enable_evaluation
+    baseline_bucket_arn = var.enable_evaluation ? aws_s3_bucket.evaluation_baseline_bucket[0].arn : null
+  }
+
+  # Reporting configuration
+  reporting = var.enable_reporting ? {
+    enabled       = true
+    bucket_arn    = aws_s3_bucket.reporting_bucket[0].arn
+    database_name = aws_glue_catalog_database.reporting_database[0].name
+  } : { enabled = false }
+
+  # API configuration.
+  #
+  # The knowledge_base sub-block is wired from the example's create_knowledge_base
+  # toggle (see knowledge-base.tf): the created KB ARN is injected so the Web UI's
+  # "Document KB" tool can query ingested documents. chat_with_document is left to
+  # the root default (on), which pairs with the KB for retrieval-backed Q&A.
+  api = {
+    enabled = true
+    knowledge_base = {
+      enabled            = var.create_knowledge_base
+      knowledge_base_arn = try(aws_bedrockagent_knowledge_base.knowledge_base[0].arn, null)
+      model_id           = var.knowledge_base_model_id
+      embedding_model_id = var.knowledge_base_embedding_model_id
+    }
+
+    # Feature flags forwarded from var.api (previously accepted but dropped).
+    agent_analytics             = var.api.agent_analytics
+    discovery                   = var.api.discovery
+    chat_with_document          = var.api.chat_with_document
+    process_changes             = var.api.process_changes
+    enable_agent_companion_chat = var.api.enable_agent_companion_chat
+    enable_test_studio          = var.api.enable_test_studio
+    enable_fcc_dataset          = var.api.enable_fcc_dataset
+    enable_error_analyzer       = var.api.enable_error_analyzer
+    enable_mcp                  = var.api.enable_mcp
+    # v0.4.16 feature flags
+    enable_hitl                     = var.api.enable_hitl
+    enable_capacity_planning        = var.api.enable_capacity_planning
+    enable_omni_ai_dataset          = var.api.enable_omni_ai_dataset
+    enable_docplit_poly_seq_dataset = var.api.enable_docplit_poly_seq_dataset
+  }
+
+  # Feature flags (DEPRECATED - use api variable instead)
+  # These are kept for backward compatibility during migration
+  enable_api         = var.enable_api
+  agent_analytics    = var.agent_analytics
+  chat_with_document = var.chat_with_document
+  process_changes    = var.process_changes
+  discovery          = var.discovery
+
+  rbac = var.rbac
+
+  # Layer configuration
+  force_rebuild_layers = var.force_rebuild_layers
+
+  # Web UI configuration
+  web_ui = {
+    enabled                      = var.web_ui.enabled
+    create_infrastructure        = var.web_ui.create_infrastructure
+    bucket_name                  = var.web_ui.bucket_name
+    cloudfront_distribution_id   = var.web_ui.cloudfront_distribution_id
+    logging_enabled              = var.web_ui.logging_enabled
+    logging_bucket_arn           = var.web_ui.logging_bucket_arn
+    logging_bucket_force_destroy = var.web_ui.logging_bucket_force_destroy
+    enable_signup                = var.web_ui.enable_signup
+    display_name                 = "SageMaker UDOP Processor (${element(split("/", var.config_file_path), length(split("/", var.config_file_path)) - 2)})"
+  }
+
+  # General configuration
+  prefix                           = var.prefix
+  seed_managed_configs             = var.seed_managed_configs
+  log_level                        = var.log_level
+  log_retention_days               = var.log_retention_days
+  data_tracking_retention_days     = var.data_tracking_retention_days
+  bedrock_guardrail_id_and_version = var.bedrock_guardrail_id_and_version
+
+  # Build strategy (CodeBuild by default; flip to local-build via tfvars)
+  build = var.build
+
+  tags = var.tags
+}

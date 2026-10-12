@@ -1,0 +1,57 @@
+# Bedrock-LLM Processor (VPC) — copy to terraform.tfvars and set the values below.
+# Everything else uses the defaults in variables.tf.
+
+region      = "us-east-1"
+prefix      = "genai-idp-vpc"
+admin_email = "admin@example.com"
+
+# Networking: create a new VPC (default) …
+vpc_cidr = "10.0.0.0/16"
+# … or reuse an existing one (comment out vpc_cidr above):
+# vpc = {
+#   vpc_id                 = "vpc-12345678"
+#   vpc_subnet_ids         = ["subnet-aaaa", "subnet-bbbb"]
+#   vpc_security_group_ids = ["sg-12345678"]
+# }
+
+# ── Optional overrides (defaults shown; uncomment to change) ────────────────
+# Per-stage model IDs are set in the config YAML (config_file_path), not here.
+# config_file_path        = "../../sources/config_library/unified/rule-validation/config.yaml"
+# tags = { Environment = "dev" }
+
+# ── API visibility + Knowledge Base ─────────────────────────────────────────
+# Keep the REST API private inside the VPC, and/or enable the KB backend.
+# The KB generation model MUST be a cross-region inference-profile id
+# (us./eu./apac. prefix); the embedding model is a plain foundation-model id.
+# chat-with-document is on by default.
+# api = {
+#   api_gateway_visibility = "PRIVATE"
+#   knowledge_base = {
+#     enabled            = true
+#     model_id           = "us.amazon.nova-pro-v1:0"      # generation (inference profile)
+#     embedding_model_id = "amazon.titan-embed-text-v2:0" # embeddings (foundation model)
+#   }
+# }
+#
+# Advanced feature toggles also live under the `api` object — see variables.tf.
+
+# Build strategy (optional) — defaults to AWS CodeBuild, preserved bit-for-bit.
+#
+# Uncomment the block below to build artifacts locally on the deploy host
+# instead of via AWS CodeBuild. This removes the CodeBuild infrastructure and
+# shortens apply time:
+#   - lambda_local = true  builds the Lambda layer zips locally with a
+#                          container runtime (Docker / Podman / Finch).
+#   - ui_local     = true  builds the web UI bundle locally with Node / npm.
+#
+# On Apple Silicon, x86_64 layer builds need amd64 emulation (podman machine
+# with Rosetta, or Docker Desktop with Rosetta). lambda_architecture only sets
+# the layers' compatible_architectures; the processor Lambda functions are
+# x86_64. See docs/content/deployment-guides/local-lambda-build.md.
+#
+# build = {
+#   lambda_local        = false     # true -> local container layer build
+#   lambda_architecture = "x86_64"  # x86_64 | arm64 (layer compatible arch)
+#   container_runtime   = "auto"    # auto | docker | podman | finch
+#   ui_local            = false     # true -> local npm web UI build
+# }

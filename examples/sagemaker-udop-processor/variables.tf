@@ -1,0 +1,391 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+variable "region" {
+  description = "AWS region to deploy resources"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "prefix" {
+  description = "Prefix to add to resource names"
+  type        = string
+  default     = "idp"
+}
+
+# User Identity Configuration
+variable "admin_email" {
+  description = "Optional email address for the admin user. If provided, an admin user will be created in the Cognito User Pool."
+  type        = string
+  default     = null
+}
+
+variable "log_level" {
+  description = "The log level for the document processing components"
+  type        = string
+  default     = "INFO"
+  validation {
+    condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], var.log_level)
+    error_message = "Allowed values for log_level are \"DEBUG\", \"INFO\", \"WARNING\", \"ERROR\", or \"CRITICAL\"."
+  }
+}
+
+variable "log_retention_days" {
+  description = "Retention period in days for CloudWatch logs from the document-processing components. Null (default) uses the deployment default."
+  type        = number
+  default     = null
+  validation {
+    condition     = var.log_retention_days == null ? true : contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653], var.log_retention_days)
+    error_message = "Log retention days must be one of the allowed values."
+  }
+}
+
+variable "data_tracking_retention_days" {
+  description = "The retention period for document tracking data in days"
+  type        = number
+  default     = 365
+}
+
+# Feature flags
+# API Configuration (Consolidated)
+variable "api" {
+  description = "Configuration for the REST API and all API-related features"
+  type = object({
+    # Core API configuration
+    enabled = optional(bool, true)
+
+    # Agent Analytics (GraphQL resolvers for agent functionality)
+    agent_analytics = optional(object({
+      enabled  = optional(bool, false)
+      model_id = optional(string, "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    }), { enabled = false })
+
+    # Discovery (Document discovery and classification workflow)
+    discovery = optional(object({
+      enabled = optional(bool, false)
+    }), { enabled = false })
+
+    # Chat with Document (Document Q&A using Bedrock and Knowledge Base)
+    chat_with_document = optional(object({
+      enabled                  = optional(bool, true)
+      guardrail_id_and_version = optional(string, null)
+    }), { enabled = true })
+
+    # Process Changes (Document editing and reprocessing)
+    process_changes = optional(object({
+      enabled = optional(bool, false)
+    }), { enabled = false })
+
+    # Knowledge Base (external dependency for chat feature)
+    knowledge_base = optional(object({
+      enabled            = optional(bool, false)
+      knowledge_base_arn = optional(string)
+      model_id           = optional(string, "us.amazon.nova-pro-v1:0")
+      embedding_model_id = optional(string, "amazon.titan-embed-text-v2:0")
+    }), { enabled = false })
+
+    # v0.4.8 feature flags
+    enable_agent_companion_chat = optional(bool, false)
+    enable_test_studio          = optional(bool, false)
+    enable_fcc_dataset          = optional(bool, false)
+    enable_error_analyzer       = optional(bool, false)
+    enable_mcp                  = optional(bool, false)
+
+    # v0.4.16 feature flags
+    enable_hitl                     = optional(bool, true)
+    enable_capacity_planning        = optional(bool, false)
+    enable_omni_ai_dataset          = optional(bool, false)
+    enable_docplit_poly_seq_dataset = optional(bool, false)
+  })
+
+  default = {
+    enabled            = true
+    agent_analytics    = { enabled = false }
+    discovery          = { enabled = false }
+    chat_with_document = { enabled = true }
+    process_changes    = { enabled = false }
+    knowledge_base     = { enabled = false }
+  }
+
+  validation {
+    condition     = !var.api.chat_with_document.enabled || !var.api.knowledge_base.enabled || var.api.knowledge_base.knowledge_base_arn != null
+    error_message = "When api.knowledge_base.enabled is true, knowledge_base_arn must be provided."
+  }
+
+  validation {
+    condition     = !var.api.agent_analytics.enabled || var.api.agent_analytics.model_id != null
+    error_message = "When api.agent_analytics.enabled is true, model_id must be provided."
+  }
+}
+
+# DEPRECATED: Individual API feature variables (use 'api' variable instead)
+# These are kept for backward compatibility and will be removed in a future version
+variable "enable_api" {
+  description = "DEPRECATED: Use api.enabled instead. Enable the REST API for programmatic access and notifications"
+  type        = bool
+  default     = null
+}
+
+variable "agent_analytics" {
+  description = "DEPRECATED: Use api.agent_analytics instead. Configuration for agent analytics functionality"
+  type = object({
+    enabled  = optional(bool, false)
+    model_id = optional(string, "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+  })
+  default = null
+}
+
+variable "discovery" {
+  description = "DEPRECATED: Use api.discovery instead. Configuration for document discovery functionality"
+  type = object({
+    enabled = optional(bool, false)
+  })
+  default = null
+}
+
+variable "chat_with_document" {
+  description = "DEPRECATED: Use api.chat_with_document instead. Configuration for chat with document functionality"
+  type = object({
+    enabled                  = optional(bool, false)
+    guardrail_id_and_version = optional(string, null)
+  })
+  default = null
+}
+
+variable "process_changes" {
+  description = "DEPRECATED: Use api.process_changes instead. Configuration for document editing and reprocessing functionality"
+  type = object({
+    enabled = optional(bool, false)
+  })
+  default = null
+}
+
+variable "web_ui" {
+  description = "Web UI configuration object"
+  type = object({
+    enabled                      = optional(bool, true)
+    create_infrastructure        = optional(bool, true)
+    bucket_name                  = optional(string, null)
+    cloudfront_distribution_id   = optional(string, null)
+    logging_enabled              = optional(bool, true)
+    logging_bucket_arn           = optional(string, null)
+    logging_bucket_force_destroy = optional(bool, false)
+    enable_signup                = optional(string, "")
+  })
+  default = {
+    enabled                    = true
+    create_infrastructure      = true
+    bucket_name                = null
+    cloudfront_distribution_id = null
+    logging_enabled            = true
+    logging_bucket_arn         = null
+    enable_signup              = ""
+  }
+}
+
+# Evaluation Configuration
+variable "enable_evaluation" {
+  description = "Enable evaluation functionality (simplified flag)"
+  type        = bool
+  default     = false
+}
+
+# Per-stage model IDs are set in the config YAML (config_file_path), not here.
+
+# Reporting Configuration
+variable "enable_reporting" {
+  description = "Enable reporting functionality (simplified flag)"
+  type        = bool
+  default     = false
+}
+
+# SageMaker Model Training Configuration
+variable "training_config" {
+  description = "Configuration for SageMaker model training"
+  type = object({
+    max_epochs    = optional(number, 3)
+    base_model    = optional(string, "microsoft/udop-large")
+    retrain_model = optional(bool, false)
+  })
+  default = {
+    max_epochs    = 3
+    base_model    = "microsoft/udop-large"
+    retrain_model = false
+  }
+}
+
+# SageMaker Configuration
+variable "sagemaker_endpoint_name" {
+  description = "Name of the SageMaker endpoint for UDOP processing (SageMaker UDOP processor only)"
+  type        = string
+  default     = "udop-endpoint"
+}
+
+# SageMaker Classifier Configuration
+variable "classifier_instance_type" {
+  description = "SageMaker instance type for the classifier endpoint"
+  type        = string
+  default     = "ml.g4dn.xlarge"
+}
+
+variable "classifier_min_instance_count" {
+  description = "Minimum number of instances for the classifier endpoint"
+  type        = number
+  default     = 1
+}
+
+variable "classifier_max_instance_count" {
+  description = "Maximum number of instances for the classifier endpoint"
+  type        = number
+  default     = 4
+}
+
+variable "classifier_target_invocations_per_instance_per_minute" {
+  description = "Target invocations per instance per minute for classifier scaling"
+  type        = number
+  default     = 20
+}
+
+variable "classifier_scale_in_cooldown_seconds" {
+  description = "Cooldown period after scaling in (seconds) for classifier"
+  type        = number
+  default     = 300
+}
+
+variable "classifier_scale_out_cooldown_seconds" {
+  description = "Cooldown period after scaling out (seconds) for classifier"
+  type        = number
+  default     = 60
+}
+
+variable "encryption_key_arn" {
+  description = "ARN of the KMS key for encryption (will be created if not provided)"
+  type        = string
+  default     = null
+}
+
+# Summarization Configuration
+# Summarization enablement comes from the config YAML (summarization.enabled).
+
+# Rule-validation enablement comes from the config YAML (rule_validation.enabled).
+
+
+
+# Extraction model is required by the UDOP Lambda env vars; the slim
+# rvl-cdip config doesn't ship one so we expose it explicitly.
+
+
+# Configuration File Path
+variable "config_file_path" {
+  description = "Path to the configuration YAML file for document processing"
+  type        = string
+  default     = "../../sources/config_library/unified/rvl-cdip/config.yaml"
+}
+
+variable "additional_config_files" {
+  description = "Extra config versions to seed alongside the default, as version_name => path to a YAML file (relative to this example dir or absolute). Each shows in the UI version dropdown as an editable, non-active version. Manage this list from terraform.tfvars."
+  type        = map(string)
+  default     = {}
+}
+
+# --------------------------------------------------------------------------
+# Optional Knowledge Base backend
+# --------------------------------------------------------------------------
+#
+# When create_knowledge_base = true (default), this example stands up an
+# OpenSearch Serverless vector collection + Bedrock Knowledge Base that ingests
+# processed documents from the OUTPUT bucket, and wires its ARN into the API's
+# knowledge_base feature so the Web UI's "Agent Companion Chat" / "Document KB"
+# tools can query them.
+
+variable "create_knowledge_base" {
+  description = "Create the optional Bedrock Knowledge Base backend (OpenSearch Serverless collection, vector index, KB + S3 data source ingesting from the output bucket, and ingestion Lambda) and wire its ARN into the API's knowledge_base feature."
+  type        = bool
+  default     = true
+}
+
+variable "knowledge_base_model_id" {
+  description = "Inference-profile id used by the Knowledge Base for RetrieveAndGenerate (query/generation). Use a cross-region inference-profile id (e.g. us.amazon.nova-pro-v1:0); the resolver builds the inference-profile ARN from it."
+  type        = string
+  default     = "us.amazon.nova-pro-v1:0"
+}
+
+variable "knowledge_base_embedding_model_id" {
+  description = "Foundation-model id used to embed documents into the Knowledge Base vector index. Must match the vector index dimension (titan-embed-text-v2:0 => 1024, as configured in knowledge-base.tf)."
+  type        = string
+  default     = "amazon.titan-embed-text-v2:0"
+}
+
+variable "tags" {
+  description = "Tags to apply to all resources"
+  type        = map(string)
+  default     = {}
+}
+
+variable "force_rebuild_layers" {
+  description = "Force rebuild of Lambda layers regardless of requirements changes"
+  type        = bool
+  default     = false
+}
+
+#
+# Build strategy. Forwarded verbatim to the wrapper's var.build. Defaults
+# preserve the historical CodeBuild path; set lambda_local = true to opt
+# into the local-build path (requires Docker/Podman/Finch on the deploy
+# host). See docs/content/deployment-guides/local-lambda-build.md.
+#
+variable "build" {
+  description = "Build strategy for Lambda layers and processor container images."
+  type = object({
+    lambda_local        = optional(bool, false)
+    lambda_architecture = optional(string, "arm64")
+    container_runtime   = optional(string, "auto")
+    ui_local            = optional(bool, false)
+  })
+  default = {
+    lambda_local        = false
+    lambda_architecture = "arm64"
+    container_runtime   = "auto"
+    ui_local            = false
+  }
+}
+
+variable "rbac" {
+  description = "Configuration for the RBAC feature plugin. Default-off. When enabled, wires module.rbac through the feature-plugin path."
+  type = object({
+    enabled = optional(bool, false)
+    group_names = optional(object({
+      admin    = optional(string, "Admin")
+      author   = optional(string, "Author")
+      reviewer = optional(string, "Reviewer")
+      viewer   = optional(string, "Viewer")
+    }), {})
+    allowed_signup_email_domains = optional(string, "")
+  })
+  default = {
+    enabled = false
+  }
+}
+
+variable "seed_managed_configs" {
+  description = "Seed the managed baseline configuration versions (RVL-CDIP docsplit, fake-w2, ocr-benchmark, realkie-fcc) as non-active reference rows. Set true to include them."
+  type        = bool
+  default     = false
+}
+
+variable "deployer_role_arn" {
+  description = "IAM role ARN granted data access on the OpenSearch Serverless collection. Must be a role ARN, not a session ARN: AOSS matches any session of a role, so a session ARN pins the policy to one operator. Defaults to deriving the role from the caller, which drops any path on the role."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.deployer_role_arn == "" || !can(regex(":assumed-role/", var.deployer_role_arn))
+    error_message = "deployer_role_arn must be an IAM role ARN (arn:<partition>:iam::<account>:role/<name>), not an STS assumed-role session ARN."
+  }
+}
+
+variable "bedrock_guardrail_id_and_version" {
+  description = "Bedrock Guardrail applied to every model interaction, as `id:version`. Null applies no guardrail."
+  type        = string
+  default     = null
+}

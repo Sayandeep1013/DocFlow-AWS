@@ -1,0 +1,157 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+/**
+ * # BDA Processor (thin public façade)
+ *
+ * This module is the public BDA processor façade. It mirrors the CDK
+ * accelerator's `BdaProcessor` package (verified against
+ * `cdklabs/genai-idp@main`): a thin façade that performs only the
+ * BDA-specific, pattern-specific setup and delegates ALL document processing to
+ * the shared internal engine (`modules/processors/unified-processor/`) via a
+ * nested `module "engine"`. The engine always deploys both the BDA branch and
+ * the pipeline branch and routes each document at runtime by its config
+ * version's `use_bda` flag; there is no deploy-time branch selector.
+ *
+ * Pattern-specific (BDA-only) concern handled here:
+ *   * The Bedrock Data Automation Project ARN that the BDA branch invokes. In
+ *     this Terraform wrapper the project is **consumer-supplied** through the
+ *     required `var.data_automation_project_arn` (root: `var.processor.project_arn`)
+ *     rather than synthesized from config classes. This is a deliberate
+ *     divergence from the CDK `BdaProcessor`, which builds Blueprints + a
+ *     `DataAutomationProject` at synth time (CDK uses a CFN custom resource that
+ *     has no native Terraform-provider equivalent). The public input surface is
+ *     preserved so the root `module.bda_processor` call still type-checks. The
+ *     project id is parsed for the `project_id` output. The engine always
+ *     deploys the BDA branch (which grants `bedrock:InvokeDataAutomationAsync`
+ *     and runs the BDA invoke / completion / process-results Lambdas + state
+ *     machine); the per-configuration-version link between this ARN and the BDA
+ *     branch is established through configuration seeding, not a deploy-time
+ *     engine input.
+ *
+ * Everything else (Lambdas, Step Functions state machine, IAM, SQS DLQs,
+ * CloudWatch log groups, config seeding) is owned by the shared engine. The
+ * former monolithic implementation (its own ECR + CodeBuild image pipeline,
+ * pattern-1 `archive_file`/`templatefile`/`file()` references, per-function IAM,
+ * and state machine) has been removed.
+ */
+
+data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
+
+# Parse the consumer-supplied Data Automation Project ARN so the module can
+# expose the project id as an output. `aws_arn` does not validate existence; it
+# only decomposes the ARN string at plan time.
+data "aws_arn" "data_automation_project" {
+  arn = var.data_automation_project_arn
+}
+
+locals {
+  # Bedrock Data Automation project id, parsed from
+  # "data-automation-project/<id>".
+  project_id = element(split("/", data.aws_arn.data_automation_project.resource), 1)
+
+  # Summarization enablement is config-authoritative: config value, falling back
+  # to the upstream system default (base-summarization.yaml => true) that the
+  # seeder merges in when the config file omits the section. A plain
+  # try(..., false) would wrongly disable summarization for the sparse example
+  # configs. Mirrors the model resolution in unified-processor/locals.tf.
+  _default_summarization_enabled = try(yamldecode(file("${path.module}/../../../sources/lib/idp_common_pkg/idp_common/config/system_defaults/base-summarization.yaml")).summarization.enabled, false)
+  is_summarization_enabled       = try(var.config.summarization.enabled, local._default_summarization_enabled)
+
+  # Evaluation is enabled when a baseline bucket name is supplied by the root.
+  evaluation_enabled = var.evaluation_baseline_bucket_name != ""
+
+  # Reconstruct the baseline bucket ARN expected by the engine from the bucket
+  # name the root passes (S3 ARNs are partition-scoped, account-agnostic).
+  evaluation_baseline_bucket_arn = local.evaluation_enabled ? "arn:${data.aws_partition.current.partition}:s3:::${var.evaluation_baseline_bucket_name}" : null
+
+  # Force the default config version onto the BDA branch: routing keys off
+  # `$.document.use_bda`, and linking BdaProjectArn alone does not set it. The
+  # shared lending sample ships `use_bda: false`, so this override must win.
+  config_with_bda = merge(var.config, { use_bda = true })
+}
+
+# =============================================================================
+# Shared internal engine (unified-processor)
+# =============================================================================
+# Delegates ALL document processing to the shared engine. The engine always
+# deploys both branches and routes per document at runtime.
+module "engine" {
+  source = "../unified-processor"
+
+  allowed_bedrock_model_ids = var.allowed_bedrock_model_ids
+
+  name = var.name
+
+  # Lambda architecture (must match the idp_common layer build architecture).
+  lambda_architecture = var.lambda_architecture
+
+  # IDP v0.6 `ocr.backend: bda` support (deployment-scoped BDA OCR project).
+  enable_bda_ocr_backend = var.enable_bda_ocr_backend
+
+  # API wiring
+  enable_api      = var.enable_api
+  api_id          = var.api_id
+  api_arn         = var.api_arn
+  api_graphql_url = var.api_graphql_url
+
+  # Shared environment ARNs
+  input_bucket_arn        = var.input_bucket_arn
+  output_bucket_arn       = var.output_bucket_arn
+  working_bucket_arn      = var.working_bucket_arn
+  configuration_table_arn = var.configuration_table_arn
+  tracking_table_arn      = var.tracking_table_arn
+  concurrency_table_arn   = var.concurrency_table_arn
+
+  # Processing environment configuration
+  metric_namespace   = var.metric_namespace
+  log_level          = var.log_level
+  log_retention_days = var.log_retention_days
+
+  # Encryption
+  encryption_key_arn = var.encryption_key_arn
+  enable_encryption  = var.enable_encryption
+
+  # Layers
+  idp_common_layer_arn      = var.idp_common_layer_arn
+  base_layer_arn            = var.base_layer_arn
+  evaluation_layer_arn      = var.evaluation_layer_arn
+  rule_validation_layer_arn = var.rule_validation_layer_arn
+
+  # VPC configuration
+  vpc_subnet_ids         = var.vpc_subnet_ids
+  vpc_security_group_ids = var.vpc_security_group_ids
+
+  # Rule validation
+  enable_rule_validation = var.enable_rule_validation
+
+  # Summarization
+  is_summarization_enabled = local.is_summarization_enabled
+  summarization_guardrail  = var.summarization_guardrail
+
+  # Evaluation
+  evaluation_enabled             = local.evaluation_enabled
+  evaluation_baseline_bucket_arn = local.evaluation_baseline_bucket_arn
+  reporting_bucket_name          = var.reporting_bucket_name
+  save_reporting_function_name   = var.save_reporting_function_name
+  save_reporting_function_arn    = var.save_reporting_function_arn
+
+  # Document processing configuration
+  config                             = local.config_with_bda
+  max_processing_concurrency         = var.max_processing_concurrency
+  workflow_execution_timeout_seconds = var.workflow_execution_timeout_seconds
+
+  # Extra non-active config versions seeded alongside the default
+  additional_configurations = var.additional_configurations
+  seed_managed_configs      = var.seed_managed_configs
+
+  # Link the `default` config version to the BDA project so this façade routes
+  # to BDA out of the box; also the fallback for its own use_bda:true versions.
+  default_bda_project_arn = var.data_automation_project_arn
+
+  # Lambda tracing configuration
+  lambda_tracing_mode = var.lambda_tracing_mode
+
+  tags = var.tags
+}

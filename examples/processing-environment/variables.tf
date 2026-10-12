@@ -1,0 +1,104 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+variable "region" {
+  description = "AWS region to deploy resources"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "prefix" {
+  description = "Prefix to add to resource names"
+  type        = string
+  default     = "idp"
+}
+
+variable "log_level" {
+  description = "The log level for the document processing components"
+  type        = string
+  default     = "INFO"
+  validation {
+    condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], var.log_level)
+    error_message = "Allowed values for log_level are \"DEBUG\", \"INFO\", \"WARNING\", \"ERROR\", or \"CRITICAL\"."
+  }
+}
+
+variable "log_retention_days" {
+  description = "Retention period in days for CloudWatch logs from the document-processing components. Null (default) uses the deployment default."
+  type        = number
+  default     = null
+  validation {
+    condition     = var.log_retention_days == null ? true : contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653], var.log_retention_days)
+    error_message = "Log retention days must be one of the allowed values."
+  }
+}
+
+variable "data_tracking_retention_days" {
+  description = "The retention period for document tracking data in days"
+  type        = number
+  default     = 365
+}
+
+variable "idp_common_layer_extras" {
+  description = "List of extra dependencies to include in the IDP common layer"
+  type        = list(string)
+  default     = ["appsync", "evaluation"]
+  validation {
+    condition = alltrue([
+      for extra in var.idp_common_layer_extras : contains([
+        "core", "image", "ocr", "classification", "extraction", "evaluation", "appsync", "all"
+      ], extra)
+    ])
+    error_message = "Valid extras are: core, image, ocr, classification, extraction, evaluation, appsync, all."
+  }
+}
+
+variable "force_layer_rebuild" {
+  description = "Force rebuild of the IDP common layer regardless of changes"
+  type        = bool
+  default     = false
+}
+
+# Evaluation Configuration
+variable "enable_evaluation" {
+  description = "Enable evaluation functionality with baseline comparison"
+  type        = bool
+  default     = false
+}
+
+# Reporting Configuration
+variable "enable_reporting" {
+  description = "Enable analytics and reporting environment"
+  type        = bool
+  default     = false
+}
+
+variable "tags" {
+  description = "A map of tags to add to all resources"
+  type        = map(string)
+  default = {
+    Environment = "development"
+    Project     = "GenAI-IDP"
+  }
+}
+
+#
+# Build strategy. Threaded to processing-environment and idp-common-layer.
+# Defaults preserve the historical CodeBuild path.
+# See docs/content/deployment-guides/local-lambda-build.md.
+#
+variable "build" {
+  description = "Build strategy for Lambda layers."
+  type = object({
+    lambda_local        = optional(bool, false)
+    lambda_architecture = optional(string, "arm64")
+    container_runtime   = optional(string, "auto")
+    ui_local            = optional(bool, false)
+  })
+  default = {
+    lambda_local        = false
+    lambda_architecture = "arm64"
+    container_runtime   = "auto"
+    ui_local            = false
+  }
+}

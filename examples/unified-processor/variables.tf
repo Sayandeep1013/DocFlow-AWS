@@ -1,0 +1,312 @@
+# Copyright Amazon.com, Inc. or its affiliates. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+variable "region" {
+  description = "AWS region to deploy resources"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "prefix" {
+  description = "Prefix to add to resource names"
+  type        = string
+  default     = "idp-unified"
+}
+
+variable "admin_email" {
+  description = "Optional email address for the admin user. If provided, an admin user will be created in the Cognito User Pool."
+  type        = string
+  default     = null
+}
+
+variable "log_level" {
+  description = "The log level for the document processing components"
+  type        = string
+  default     = "INFO"
+  validation {
+    condition     = contains(["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], var.log_level)
+    error_message = "Allowed values for log_level are \"DEBUG\", \"INFO\", \"WARNING\", \"ERROR\", or \"CRITICAL\"."
+  }
+}
+
+variable "log_retention_days" {
+  description = "Retention period in days for CloudWatch logs from the document-processing components. Null (default) uses the deployment default."
+  type        = number
+  default     = null
+  validation {
+    condition     = var.log_retention_days == null ? true : contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653], var.log_retention_days)
+    error_message = "Log retention days must be one of the allowed values."
+  }
+}
+
+variable "data_tracking_retention_days" {
+  description = "The retention period for document tracking data in days"
+  type        = number
+  default     = 365
+}
+
+variable "discovery_allowed_cors_origins" {
+  description = "Allowed CORS origins for the discovery upload bucket. Set to the deployed web-UI origin (e.g. [\"https://xxxx.cloudfront.net\"]) to close Wiz S3-036. Empty falls back to [\"*\"]."
+  type        = list(string)
+  default     = []
+}
+
+# --------------------------------------------------------------------------
+# Dual-mode routing configuration
+# --------------------------------------------------------------------------
+#
+# This example deploys ONE processor (one state machine) that routes documents
+# to two different branches by their configuration version:
+#
+#   - the `default` version stays Bedrock-LLM (use_bda absent)
+#   - a BDA-linked additional version sets use_bda=true and carries a top-level
+#     bda_project_arn (the catalog convention), routing to the BDA branch.
+#
+# The BDA project ARN is supplied here (via terraform.tfvars, gitignored). It is
+# NOT a deploy-time branch gate — both branches are always deployed and routing
+# happens at runtime on the config version's use_bda flag.
+
+variable "bda_project_arn" {
+  description = "ARN of an existing Bedrock Data Automation project to link to the BDA configuration version. Ignored when create_bda_project = true. Leave empty to seed the BDA version unlinked (it degrades to the Bedrock-LLM branch until a project is linked)."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.bda_project_arn == "" || can(regex("data-automation-project/", var.bda_project_arn))
+    error_message = "bda_project_arn must be empty or a Bedrock Data Automation project ARN (contains 'data-automation-project/')."
+  }
+}
+
+variable "create_bda_project" {
+  description = "Create a Bedrock Data Automation project in this example (self-contained on a clean account) and link it to the BDA config version. When false, supply an existing project via bda_project_arn."
+  type        = bool
+  default     = false
+}
+
+variable "bda_version_name" {
+  description = "Name of the BDA-linked configuration version seeded alongside the Bedrock-LLM default. Upload a document with S3 object metadata config-version=<this value> to route it through the BDA branch."
+  type        = string
+  default     = "bda"
+}
+
+# Configuration File Path (default = Bedrock-LLM lending sample; it does NOT set
+# use_bda, so the default version routes to the Bedrock-LLM branch).
+variable "config_file_path" {
+  description = "Path to the default (Bedrock-LLM) configuration YAML file. The lending package sample does not set use_bda, so the default version routes through the Bedrock-LLM branch."
+  type        = string
+  default     = "../../sources/config_library/unified/lending-package-sample/config.yaml"
+}
+
+# Rule-validation enablement comes from the config YAML (rule_validation.enabled).
+
+variable "allowed_bedrock_model_ids" {
+  description = "Bedrock model IDs every processing step may invoke, on top of the models resolved from the seeded configs. Set this for models operators will pick in the UI later, which Terraform cannot see. Use [\"*\"] to allow any Bedrock model."
+  type        = list(string)
+  default     = []
+}
+
+variable "additional_config_files" {
+  description = "Optional extra config versions to seed alongside the default and the BDA version, as version_name => path to a YAML file (relative to this example dir or absolute). Each shows in the UI version dropdown as an editable, non-active version. A top-level bda_project_arn key inside a file links that version to a BDA project."
+  type        = map(string)
+  default     = {}
+}
+
+# Model Configuration
+#
+# Per-stage model IDs are set in the YAML configuration (var.config_file_path),
+# not here. allowed_bedrock_model_ids remains the operator escape hatch.
+
+# --------------------------------------------------------------------------
+# Optional Knowledge Base backend & chat-with-document
+# --------------------------------------------------------------------------
+#
+# When create_knowledge_base = true, this example stands up an OpenSearch
+# Serverless vector collection + Bedrock Knowledge Base that ingests processed
+# documents from the OUTPUT bucket, and wires its ARN into the API's
+# knowledge_base feature. Together with enable_chat_with_document this makes the
+# Web UI's "Agent Companion Chat" / "Document KB" tools work. Default off so the
+# example stays a lightweight dual-mode routing demo.
+
+variable "create_knowledge_base" {
+  description = "Create the optional Bedrock Knowledge Base backend (OpenSearch Serverless collection, vector index, KB + S3 data source ingesting from the output bucket, and ingestion Lambda) and wire its ARN into the API's knowledge_base feature. Default on."
+  type        = bool
+  default     = true
+}
+
+variable "chat_with_document_enabled" {
+  description = "Enable the per-document Q&A 'chat with document' feature in the API/Web UI. Does not require a Knowledge Base (calls Bedrock directly)."
+  type        = bool
+  default     = true
+}
+
+variable "create_discovery" {
+  description = "Enable the Discovery feature (Web UI 'Discovery' tab). Provisions the discovery S3 bucket, tracking table, SQS queue, upload/processor Lambdas, and its REST dispatcher entries, and populates the UI's DiscoveryBucket setting. Discovery uses Bedrock to auto-detect document classes/schemas from uploaded samples; with no discovery.* model configured it defaults to global.anthropic.claude-sonnet-4-6 (must be enabled in Bedrock for this region). Default on."
+  type        = bool
+  default     = true
+}
+
+variable "knowledge_base_model_id" {
+  description = "Inference-profile id used by the Knowledge Base for RetrieveAndGenerate (query/generation). Use a cross-region inference-profile id (e.g. us.amazon.nova-pro-v1:0); the resolver builds the inference-profile ARN from it. nova-pro is only invokable via its cross-region profile, so the us. prefix is required."
+  type        = string
+  default     = "us.amazon.nova-pro-v1:0"
+}
+
+variable "knowledge_base_embedding_model_id" {
+  description = "Foundation-model id used to embed documents into the Knowledge Base vector index. Must match the vector index dimension (titan-embed-text-v2:0 => 1024, as configured in knowledge-base.tf)."
+  type        = string
+  default     = "amazon.titan-embed-text-v2:0"
+}
+
+variable "web_ui" {
+  description = "Web UI configuration object"
+  type = object({
+    enabled                      = optional(bool, true)
+    create_infrastructure        = optional(bool, true)
+    bucket_name                  = optional(string, null)
+    cloudfront_distribution_id   = optional(string, null)
+    logging_enabled              = optional(bool, true)
+    logging_bucket_arn           = optional(string, null)
+    logging_bucket_force_destroy = optional(bool, false)
+    enable_signup                = optional(string, "")
+  })
+  default = {
+    enabled = true
+  }
+}
+
+# Deriving these from the deployed Web UI is not possible here. The Web UI module
+# needs the client id to bake it into the SPA build, and it is what creates the
+# CloudFront distribution, so referencing its url back on the client is a cycle.
+# Upstream avoids the same cycle by not passing the client id to its API stack
+# (sources/template.yaml, the note above UserPoolId). Untangling that here means
+# changing how the SPA receives the client id, so the url is supplied instead.
+variable "additional_callback_urls" {
+  description = <<-EOT
+    Extra OAuth callback URLs to allow on the user pool client, on top of
+    localhost. Set this to the deployed Web UI url, with a trailing slash, or
+    hosted-UI and federated sign-in fail with redirect_mismatch. The url is only
+    known after the first apply, so this is a second-pass value: apply, read
+    `web_ui_url`, set this, apply again.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
+variable "additional_logout_urls" {
+  description = "Extra OAuth logout URLs to allow on the user pool client, on top of localhost."
+  type        = list(string)
+  default     = []
+}
+
+variable "tags" {
+  description = "Tags to apply to all resources"
+  type        = map(string)
+  default     = {}
+}
+
+variable "rbac" {
+  description = "Configuration for the RBAC feature plugin. Default-off. When enabled, wires module.rbac through the feature-plugin path."
+  type = object({
+    enabled = optional(bool, false)
+    group_names = optional(object({
+      admin    = optional(string, "Admin")
+      author   = optional(string, "Author")
+      reviewer = optional(string, "Reviewer")
+      viewer   = optional(string, "Viewer")
+    }), {})
+    allowed_signup_email_domains = optional(string, "")
+  })
+  default = {
+    enabled = false
+  }
+}
+
+variable "seed_managed_configs" {
+  description = "Seed the managed baseline configuration versions (RVL-CDIP docsplit, fake-w2, ocr-benchmark, realkie-fcc) as non-active reference rows. Set true to include them."
+  type        = bool
+  default     = false
+}
+
+variable "build" {
+  description = "Build strategy for Lambda layers and the web UI (CodeBuild by default; local Docker/npm when the *_local flags are true)."
+  type = object({
+    lambda_local        = optional(bool, false)
+    lambda_architecture = optional(string, "arm64")
+    container_runtime   = optional(string, "auto")
+    ui_local            = optional(bool, false)
+  })
+  default = {
+    lambda_local        = false
+    lambda_architecture = "arm64"
+    container_runtime   = "auto"
+    ui_local            = false
+  }
+}
+
+# =============================================================================
+# Agent features (Web UI). All default off.
+# =============================================================================
+
+variable "enable_agent_companion_chat" {
+  description = "Enable the Agent Companion Chat panel in the Web UI (multi-agent chat sessions)."
+  type        = bool
+  default     = false
+}
+
+variable "enable_agent_analytics" {
+  description = "Enable the Agent Analytics agent (populates the Web UI 'Available Agents' list). Requires reporting; when true the example provisions a reporting S3 bucket + Glue database and wires the reporting module."
+  type        = bool
+  default     = false
+}
+
+variable "enable_mcp" {
+  description = "Enable custom MCP agents via Bedrock AgentCore Gateway."
+  type        = bool
+  default     = false
+}
+
+variable "enable_evaluation" {
+  description = "Enable accuracy evaluation of extraction results against baseline documents. When true the example provisions a baseline bucket and wires the evaluation function, which produces the accuracy metrics that Test Studio reports on."
+  type        = bool
+  default     = false
+}
+
+variable "enable_test_studio" {
+  description = "Enable the Test Studio feature (Web UI Test Sets / Test Execution tabs): test-runner, test-set, and test-results resolvers plus their dispatcher fields. Accuracy metrics require enable_evaluation = true."
+  type        = bool
+  default     = false
+}
+
+variable "enable_finetuning" {
+  description = "Enable the fine-tuning / Custom Models subsystem (Bedrock model customization from Test Studio test sets). Requires enable_test_studio = true."
+  type        = bool
+  default     = false
+}
+
+variable "federation_pool_wiring" {
+  description = "Second-apply wiring that attaches external IdP federation to the Cognito pool this example creates. The pool lives outside the module while the federation resources are created inside it, so referencing them directly would close a dependency cycle. Apply once with idp_federation.enabled, read the module's federation_group_mapping_function_arn and federation_supported_identity_providers outputs, set them here, then apply again. See docs/content/security/external-idp.md."
+  type = object({
+    supported_identity_providers      = optional(list(string), [])
+    pre_token_generation_function_arn = optional(string)
+    enable_idp_groups_attribute       = optional(bool, false)
+    hosted_ui_domain_prefix           = optional(string)
+  })
+  default = {}
+}
+
+variable "deployer_role_arn" {
+  description = "IAM role ARN granted data access on the OpenSearch Serverless collection. Must be a role ARN, not a session ARN: AOSS matches any session of a role, so a session ARN pins the policy to one operator. Defaults to deriving the role from the caller, which drops any path on the role."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.deployer_role_arn == "" || !can(regex(":assumed-role/", var.deployer_role_arn))
+    error_message = "deployer_role_arn must be an IAM role ARN (arn:<partition>:iam::<account>:role/<name>), not an STS assumed-role session ARN."
+  }
+}
+
+variable "bedrock_guardrail_id_and_version" {
+  description = "Bedrock Guardrail applied to every model interaction, as `id:version`. Null applies no guardrail."
+  type        = string
+  default     = null
+}
